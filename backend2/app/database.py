@@ -654,6 +654,82 @@ _INSURANCE_COMPANY_PATTERNS: dict[str, list[str]] = {
 }
 
 
+async def upsert_carrier(record: dict) -> bool:
+    """
+    Upsert a carrier record from the scraper into the Census carriers table.
+    Maps the scraped field names to Census column names where they differ.
+    Uses dot_number as the conflict key since the Census table is keyed on it.
+    """
+    pool = get_pool()
+    dot = str(record.get("dot_number") or "").strip()
+    if not dot:
+        return False
+
+    # Build the insurance JSONB from insurance_policies if present
+    insurance = record.get("insurance_policies") or record.get("insurance")
+
+    try:
+        await pool.execute(
+            """
+            INSERT INTO carriers (
+                dot_number, legal_name, dba_name, status_code, classdef,
+                email_address, phone, power_units, total_drivers,
+                phy_street, phy_city, phy_state, phy_zip,
+                carrier_mailing_street, carrier_mailing_city, carrier_mailing_state, carrier_mailing_zip,
+                mcs150_date, mcs150_mileage, dun_bradstreet_no, hm_ind,
+                dockets, cargo, insurance
+            ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9,
+                $10, $11, $12, $13,
+                $14, $15, $16, $17,
+                $18, $19, $20, $21,
+                $22::jsonb, $23::jsonb, $24::jsonb
+            )
+            ON CONFLICT (dot_number) DO UPDATE SET
+                legal_name = COALESCE(EXCLUDED.legal_name, carriers.legal_name),
+                dba_name = COALESCE(EXCLUDED.dba_name, carriers.dba_name),
+                status_code = COALESCE(EXCLUDED.status_code, carriers.status_code),
+                classdef = COALESCE(EXCLUDED.classdef, carriers.classdef),
+                email_address = COALESCE(EXCLUDED.email_address, carriers.email_address),
+                phone = COALESCE(EXCLUDED.phone, carriers.phone),
+                power_units = COALESCE(EXCLUDED.power_units, carriers.power_units),
+                total_drivers = COALESCE(EXCLUDED.total_drivers, carriers.total_drivers),
+                mcs150_date = COALESCE(EXCLUDED.mcs150_date, carriers.mcs150_date),
+                mcs150_mileage = COALESCE(EXCLUDED.mcs150_mileage, carriers.mcs150_mileage),
+                insurance = COALESCE(EXCLUDED.insurance, carriers.insurance)
+            """,
+            dot,
+            record.get("legal_name"),
+            record.get("dba_name"),
+            # Map status string back to status_code
+            "A" if str(record.get("status", "")).upper().startswith("AUTHORIZED") else "I",
+            record.get("entity_type"),  # store in classdef column
+            record.get("email"),
+            record.get("phone"),
+            record.get("power_units"),
+            record.get("drivers"),
+            # Address — split if possible, else store whole in phy_street
+            record.get("physical_address"),
+            None, None, None,
+            record.get("mailing_address"),
+            None, None, None,
+            record.get("mcs150_date"),
+            record.get("mcs150_mileage"),
+            record.get("duns_number"),
+            "Y" if record.get("cargo_carried") and any(
+                "haz" in c.lower() for c in (record.get("cargo_carried") or [])
+            ) else "N",
+            _to_jsonb(record.get("mc_number") and [f"MC{record['mc_number']}"] or []),
+            _to_jsonb({}),
+            _to_jsonb(insurance),
+        )
+        return True
+    except Exception as e:
+        print(f"[DB] Error upserting carrier DOT {dot}: {e}")
+        return False
+
+
 async def fetch_carriers(filters: dict) -> dict:
     pool = get_pool()
 
@@ -865,7 +941,10 @@ async def fetch_carriers(filters: dict) -> dict:
         )
     elif bipd_on_file == "0":
         conditions.append(
-            f"NOT {_ins_exists_raw('UPPER(ins->>''ins_type_desc'') LIKE ''BIPD%'' AND (ins->>''cancl_effective_date'' IS NULL OR ins->>''cancl_effective_date'' = '''')')}"
+            "NOT " + _ins_exists_raw(
+                "UPPER(ins->>'ins_type_desc') LIKE 'BIPD%' "
+                "AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '')"
+            )
         )
 
     # Cargo on file
