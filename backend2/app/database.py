@@ -64,6 +64,10 @@ CREATE INDEX IF NOT EXISTS idx_carriers_email_address ON carriers(email_address)
 CREATE INDEX IF NOT EXISTS idx_carriers_power_units ON carriers(power_units);
 CREATE INDEX IF NOT EXISTS idx_carriers_hm_ind ON carriers(hm_ind);
 CREATE INDEX IF NOT EXISTS idx_carriers_temp ON carriers(temp);
+CREATE INDEX IF NOT EXISTS idx_carriers_legal_name ON carriers(legal_name);
+CREATE INDEX IF NOT EXISTS idx_carriers_cargo_gin ON carriers USING gin (cargo);
+CREATE INDEX IF NOT EXISTS idx_carriers_insurance_gin ON carriers USING gin (insurance);
+CREATE INDEX IF NOT EXISTS idx_carriers_dockets_gin ON carriers USING gin (dockets);
 
 CREATE INDEX IF NOT EXISTS idx_fmcsa_register_number ON fmcsa_register(number);
 CREATE INDEX IF NOT EXISTS idx_fmcsa_register_date_fetched ON fmcsa_register(date_fetched DESC);
@@ -1171,8 +1175,15 @@ async def fetch_carriers(filters: dict) -> dict:
     where = " AND ".join(conditions) if conditions else "TRUE"
 
     is_filtered = len(conditions) > 0
-    limit_val = int(filters.get("limit", 500 if is_filtered else 200))
+    limit_val = int(filters.get("limit", 200))
     offset_val = int(filters.get("offset", 0))
+
+    # ORDER BY: only sort by legal_name when filtered (trgm index helps).
+    # When unfiltered, use dot_number (b-tree indexed) — far faster on 4.5M rows.
+    if is_filtered:
+        order_by = "ORDER BY legal_name ASC"
+    else:
+        order_by = "ORDER BY dot_number ASC"
 
     query = f"""
         SELECT
@@ -1188,18 +1199,29 @@ async def fetch_carriers(filters: dict) -> dict:
             dockets, cargo, insurance
         FROM carriers
         WHERE {where}
-        ORDER BY legal_name ASC
+        {order_by}
         LIMIT {limit_val} OFFSET {offset_val}
     """
 
-    count_query = f"SELECT COUNT(*) AS cnt FROM carriers WHERE {where}"
+    # Only run COUNT when filters are active — counting 4.5M rows every page load is too slow.
+    # When unfiltered, return 0 and let the frontend use the cached total from /api/carriers/count.
+    count_query = f"SELECT COUNT(*) AS cnt FROM carriers WHERE {where}" if is_filtered else None
 
     try:
-        rows, count_row = await asyncio.gather(
-            pool.fetch(query, *params),
-            pool.fetchrow(count_query, *params),
-        )
-        filtered_count = count_row["cnt"] if count_row else 0
+        async with pool.acquire() as conn:
+            # 25-second statement timeout — fail fast instead of hanging forever
+            await conn.execute("SET statement_timeout = '25000'")
+
+            if count_query:
+                rows, count_row = await asyncio.gather(
+                    conn.fetch(query, *params),
+                    conn.fetchrow(count_query, *params),
+                )
+                filtered_count = count_row["cnt"] if count_row else 0
+            else:
+                rows = await conn.fetch(query, *params)
+                filtered_count = 0  # frontend uses cached total
+
         return {
             "data": [_carrier_row_to_dict(row) for row in rows],
             "filtered_count": filtered_count,
@@ -1223,10 +1245,19 @@ async def delete_carrier(mc_number: str) -> bool:
 
 
 async def get_carrier_count() -> int:
+    """Use pg_class reltuples for instant approximate count on large tables."""
     pool = get_pool()
     try:
-        row = await pool.fetchrow("SELECT COUNT(*) as cnt FROM carriers")
-        return row["cnt"] if row else 0
+        # reltuples gives the planner's estimate — updated by ANALYZE, accurate within ~1%
+        row = await pool.fetchrow(
+            "SELECT reltuples::bigint AS cnt FROM pg_class WHERE relname = 'carriers'"
+        )
+        approx = row["cnt"] if row else 0
+        # If estimate is 0 (table never analyzed), fall back to exact count
+        if approx <= 0:
+            row = await pool.fetchrow("SELECT COUNT(*) AS cnt FROM carriers")
+            return row["cnt"] if row else 0
+        return approx
     except Exception as e:
         print(f"[DB] Error getting carrier count: {e}")
         return 0
@@ -1242,16 +1273,19 @@ async def get_carrier_dashboard_stats() -> dict:
         "not_authorized": 0, "other": 0,
     }
     try:
-        row = await pool.fetchrow("""
-            SELECT
-                COUNT(*) AS total,
-                COUNT(*) FILTER (WHERE status_code = 'A') AS active_carriers,
-                COUNT(*) FILTER (WHERE UPPER(classdef) LIKE '%BROKER%') AS brokers,
-                COUNT(*) FILTER (WHERE email_address IS NOT NULL AND email_address != '') AS with_email,
-                COUNT(*) FILTER (WHERE status_code != 'A' OR status_code IS NULL) AS not_authorized,
-                COUNT(*) FILTER (WHERE insurance IS NOT NULL AND jsonb_array_length(insurance) > 0) AS with_insurance
-            FROM carriers
-        """)
+        async with pool.acquire() as conn:
+            await conn.execute("SET statement_timeout = '20000'")
+            # Use a single scan with conditional counts — much faster than separate queries
+            row = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE status_code = 'A') AS active_carriers,
+                    COUNT(*) FILTER (WHERE UPPER(classdef) LIKE '%BROKER%') AS brokers,
+                    COUNT(*) FILTER (WHERE email_address IS NOT NULL AND email_address != '') AS with_email,
+                    COUNT(*) FILTER (WHERE status_code IS DISTINCT FROM 'A') AS not_authorized,
+                    COUNT(*) FILTER (WHERE insurance IS NOT NULL AND jsonb_array_length(insurance) > 0) AS with_insurance
+                FROM carriers
+            """)
         if not row:
             return empty
         total = row["total"]
@@ -1265,12 +1299,12 @@ async def get_carrier_dashboard_stats() -> dict:
             "brokers": row["brokers"],
             "with_email": with_email,
             "email_rate": email_rate,
-            "with_safety_rating": 0,  # not in Census data
+            "with_safety_rating": 0,
             "with_insurance": row["with_insurance"],
-            "with_inspections": 0,    # not in Census data
-            "with_crashes": 0,        # not in Census data
+            "with_inspections": 0,
+            "with_crashes": 0,
             "not_authorized": not_auth,
-            "other": total - active - not_auth,
+            "other": max(0, total - active - not_auth),
         }
     except Exception as e:
         print(f"[DB] Error getting dashboard stats: {e}")
