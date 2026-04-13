@@ -12,9 +12,8 @@ if not DATABASE_URL:
 _pool: Optional[asyncpg.Pool] = None
 
 
+# ── Schema kept minimal — carriers table already exists with Census columns ──
 _SCHEMA_SQL = """
--- ── Tables (carriers already exists from Census import — DO NOT recreate) ──
-
 CREATE TABLE IF NOT EXISTS fmcsa_register (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     number TEXT NOT NULL,
@@ -53,27 +52,18 @@ CREATE TABLE IF NOT EXISTS blocked_ips (
     blocked_by TEXT
 );
 
--- ── Indexes on carriers (Census columns) ───────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
+-- Indexes for Census carriers table
 CREATE INDEX IF NOT EXISTS idx_carriers_dot_number ON carriers(dot_number);
 CREATE INDEX IF NOT EXISTS idx_carriers_status_code ON carriers(status_code);
 CREATE INDEX IF NOT EXISTS idx_carriers_phy_state ON carriers(phy_state);
-CREATE INDEX IF NOT EXISTS idx_carriers_carrier_op ON carriers(carrier_operation);
-CREATE INDEX IF NOT EXISTS idx_carriers_hm_ind ON carriers(hm_ind);
-CREATE INDEX IF NOT EXISTS idx_carriers_temp ON carriers(temp);
-CREATE INDEX IF NOT EXISTS idx_carriers_add_date ON carriers(add_date);
-CREATE INDEX IF NOT EXISTS idx_carriers_email ON carriers(email_address);
-
--- Trigram indexes for fast ILIKE text search
 CREATE INDEX IF NOT EXISTS idx_carriers_legal_name_trgm ON carriers USING gin (legal_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_carriers_dot_number_trgm ON carriers USING gin (dot_number gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_carriers_dba_name_trgm ON carriers USING gin (dba_name gin_trgm_ops);
-
--- GIN JSONB indexes for dockets, cargo, insurance
-CREATE INDEX IF NOT EXISTS idx_carriers_dockets_gin ON carriers USING gin (dockets jsonb_path_ops);
-CREATE INDEX IF NOT EXISTS idx_carriers_cargo_gin ON carriers USING gin (cargo jsonb_path_ops);
-CREATE INDEX IF NOT EXISTS idx_carriers_insurance_gin ON carriers USING gin (insurance jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS idx_carriers_email_address ON carriers(email_address);
+CREATE INDEX IF NOT EXISTS idx_carriers_power_units ON carriers(power_units);
+CREATE INDEX IF NOT EXISTS idx_carriers_hm_ind ON carriers(hm_ind);
+CREATE INDEX IF NOT EXISTS idx_carriers_temp ON carriers(temp);
 
 CREATE INDEX IF NOT EXISTS idx_fmcsa_register_number ON fmcsa_register(number);
 CREATE INDEX IF NOT EXISTS idx_fmcsa_register_date_fetched ON fmcsa_register(date_fetched DESC);
@@ -85,14 +75,6 @@ CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 
 CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip ON blocked_ips(ip_address);
 
--- ── Timestamp triggers ──────────────────────────────────────────────────────
-CREATE OR REPLACE FUNCTION update_fmcsa_register_updated_at()
-RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS update_fmcsa_register_updated_at ON fmcsa_register;
-CREATE TRIGGER update_fmcsa_register_updated_at BEFORE UPDATE ON fmcsa_register
-    FOR EACH ROW EXECUTE FUNCTION update_fmcsa_register_updated_at();
-
 CREATE OR REPLACE FUNCTION update_users_updated_at()
 RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;
 
@@ -100,7 +82,6 @@ DROP TRIGGER IF EXISTS update_users_updated_at ON users;
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_users_updated_at();
 
--- ── New Ventures table (ALL BrokerSnapshot CSV columns) ──────────────────────
 CREATE TABLE IF NOT EXISTS new_ventures (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     dot_number TEXT,
@@ -282,7 +263,6 @@ CREATE INDEX IF NOT EXISTS idx_new_ventures_email ON new_ventures(email_address)
 CREATE INDEX IF NOT EXISTS idx_new_ventures_hm_ind ON new_ventures(hm_ind);
 CREATE INDEX IF NOT EXISTS idx_new_ventures_carrier_op ON new_ventures(carrier_operation);
 
--- Trigram indexes for fast ILIKE text search on new_ventures
 CREATE INDEX IF NOT EXISTS idx_new_ventures_name_trgm ON new_ventures USING gin (name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_new_ventures_name_dba_trgm ON new_ventures USING gin (name_dba gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_new_ventures_dot_trgm ON new_ventures USING gin (dot_number gin_trgm_ops);
@@ -295,7 +275,6 @@ DROP TRIGGER IF EXISTS update_new_ventures_updated_at ON new_ventures;
 CREATE TRIGGER update_new_ventures_updated_at BEFORE UPDATE ON new_ventures
     FOR EACH ROW EXECUTE FUNCTION update_new_ventures_updated_at();
 
--- ── Default admin user ──────────────────────────────────────────────────────
 INSERT INTO users (user_id, name, email, role, plan, daily_limit, records_extracted_today, ip_address, is_online, is_blocked)
 VALUES ('1', 'Admin User', 'wooohan3@gmail.com', 'admin', 'Enterprise', 100000, 0, '192.168.1.1', false, false)
 ON CONFLICT (email) DO NOTHING;
@@ -327,7 +306,971 @@ def get_pool() -> asyncpg.Pool:
     return _pool
 
 
-# ── FMCSA Register functions ────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _parse_jsonb(value) -> Optional[object]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return value
+    return value
+
+
+def _to_jsonb(value) -> Optional[str]:
+    if value is None:
+        return None
+    return json.dumps(value)
+
+
+def _clean_phone(raw: Optional[str]) -> Optional[str]:
+    """Convert '2074255451.0' → '2074255451', strip junk."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    s = s.replace(" ", "").replace("-", "")
+    return s if s and s != "0" else None
+
+
+def _extract_mc_number(dockets) -> Optional[str]:
+    """Pull the first MC docket number (numeric part only) from the dockets JSONB array."""
+    if not dockets:
+        return None
+    lst = _parse_jsonb(dockets) if isinstance(dockets, str) else dockets
+    if not isinstance(lst, list):
+        return None
+    for d in lst:
+        s = str(d).strip().upper()
+        if s.startswith("MC"):
+            return s[2:]  # strip the "MC" prefix, return numeric part
+    return None
+
+
+def _cargo_list_from_jsonb(cargo_raw) -> list[str]:
+    """
+    cargo JSONB looks like:
+    {"General Freight": "X", "Fresh Produce": "X", "crgo_cargoothr_desc": "POTATOES"}
+    Return list of human-readable cargo type names (keys where value == 'X', skip meta keys).
+    """
+    if not cargo_raw:
+        return []
+    obj = _parse_jsonb(cargo_raw) if isinstance(cargo_raw, str) else cargo_raw
+    if not isinstance(obj, dict):
+        return []
+    skip_keys = {"crgo_cargoothr_desc"}
+    return [k for k, v in obj.items() if v == "X" and k not in skip_keys]
+
+
+def _classdef_to_operation_classification(classdef: Optional[str]) -> list[str]:
+    """
+    classdef: "AUTHORIZED FOR HIRE;EXEMPT FOR HIRE"
+    Maps Census classdef segments to the human-readable classification labels
+    the UI expects.
+    """
+    if not classdef:
+        return []
+    _MAP = {
+        "AUTHORIZED FOR HIRE": "Auth. For Hire",
+        "EXEMPT FOR HIRE": "Exempt For Hire",
+        "PRIVATE(PROPERTY)": "Private(Property)",
+        "PRIVATE(PASSENGER)": "Private(Passenger)",
+        "MIGRANT": "Migrant",
+        "U.S. MAIL": "U.S. Mail",
+        "FEDERAL GOVERNMENT": "Federal Government",
+        "STATE GOVERNMENT": "State Government",
+        "LOCAL GOVERNMENT": "Local Government",
+        "INDIAN TRIBE": "Indian Tribe",
+    }
+    parts = [p.strip().upper() for p in classdef.split(";") if p.strip()]
+    result = []
+    for p in parts:
+        result.append(_MAP.get(p, p.title()))
+    return result
+
+
+def _derive_carrier_operation(row: dict) -> list[str]:
+    """
+    Use interstate_*/intrastate_* driver counts to derive operating territory tags.
+    """
+    ops = []
+    def _nonzero(val):
+        try:
+            return float(val or 0) > 0
+        except (ValueError, TypeError):
+            return False
+
+    inter = _nonzero(row.get("interstate_beyond_100_miles")) or _nonzero(row.get("interstate_within_100_miles"))
+    intra_hm = _nonzero(row.get("intrastate_beyond_100_miles"))
+    intra_non = _nonzero(row.get("intrastate_within_100_miles"))
+
+    if inter:
+        ops.append("Interstate")
+    if intra_hm:
+        ops.append("Intrastate Only (HM)")
+    if intra_non and not intra_hm:
+        ops.append("Intrastate Only (Non-HM)")
+    return ops
+
+
+def _derive_entity_type(classdef: Optional[str]) -> str:
+    """Broker vs Carrier from classdef."""
+    if classdef and "BROKER" in classdef.upper():
+        return "BROKER"
+    return "CARRIER"
+
+
+def _derive_status(status_code: Optional[str]) -> str:
+    """Map status_code to human-readable status string the UI uses."""
+    mapping = {
+        "A": "AUTHORIZED FOR HIRE",
+        "I": "NOT AUTHORIZED",
+        "X": "REVOKED",
+        "N": "NOT AUTHORIZED",
+    }
+    return mapping.get((status_code or "").upper(), "NOT AUTHORIZED")
+
+
+def _format_mcs150_date(raw: Optional[str]) -> Optional[str]:
+    """
+    mcs150_date stored as '20250606 1457' or '20250606'.
+    Return 'YYYY-MM-DD' so JS Date() can parse it for yearsInBusiness calc.
+    """
+    if not raw:
+        return None
+    s = str(raw).strip().split(" ")[0]  # take date part only
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    return s
+
+
+def _format_add_date(raw: Optional[str]) -> Optional[str]:
+    """add_date stored as '19740601' → '1974-06-01'."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    return s
+
+
+def _format_insurance_from_jsonb(raw_insurance) -> list[dict]:
+    """
+    Convert the `insurance` JSONB column (list of policy dicts) into the
+    InsuranceHistoryFiling shape the frontend expects.
+    """
+    if not raw_insurance:
+        return []
+    lst = _parse_jsonb(raw_insurance) if isinstance(raw_insurance, str) else raw_insurance
+    if not isinstance(lst, list):
+        return []
+    results = []
+    for row in lst:
+        raw_amount = str(row.get("max_cov_amount") or "").strip()
+        try:
+            amount_int = int(float(raw_amount)) * 1000
+            coverage = f"${amount_int:,}"
+        except (ValueError, TypeError):
+            coverage = raw_amount or "N/A"
+        cancl = str(row.get("cancl_effective_date") or "").strip()
+        results.append({
+            "type": str(row.get("ins_type_desc") or "").strip(),
+            "coverageAmount": coverage,
+            "policyNumber": str(row.get("policy_no") or "").strip(),
+            "effectiveDate": str(row.get("effective_date") or "").strip(),
+            "carrier": str(row.get("name_company") or "").strip(),
+            "formCode": str(row.get("ins_form_code") or "").strip(),
+            "transDate": str(row.get("trans_date") or "").strip(),
+            "underlLimAmount": str(row.get("underl_lim_amount") or "").strip(),
+            "canclEffectiveDate": cancl,
+            "status": "Cancelled" if cancl else "Active",
+        })
+    return results
+
+
+def _carrier_row_to_dict(row) -> dict:
+    """
+    Convert a raw Census carriers table row into the API response shape
+    that the frontend (supabaseClient.ts mapping) expects.
+    """
+    d = dict(row)
+
+    # Extract MC number from dockets JSONB array
+    mc_number = _extract_mc_number(d.get("dockets"))
+
+    # Build physical address string
+    parts = [
+        d.get("phy_street") or "",
+        d.get("phy_city") or "",
+        d.get("phy_state") or "",
+        d.get("phy_zip") or "",
+    ]
+    physical_address = ", ".join(p for p in parts if p).strip(", ")
+
+    # Build mailing address string
+    mail_parts = [
+        d.get("carrier_mailing_street") or "",
+        d.get("carrier_mailing_city") or "",
+        d.get("carrier_mailing_state") or "",
+        d.get("carrier_mailing_zip") or "",
+    ]
+    mailing_address = ", ".join(p for p in mail_parts if p).strip(", ")
+
+    # Company representative: use company_officer_1 / company_officer_2
+    company_rep_parts = [d.get("company_officer_1") or "", d.get("company_officer_2") or ""]
+    company_rep = " ".join(p for p in company_rep_parts if p).strip() or None
+
+    classdef = d.get("classdef")
+    status_code = d.get("status_code")
+    cargo_raw = d.get("cargo")
+    insurance_raw = d.get("insurance")
+
+    return {
+        # ── IDs ──────────────────────────────────────────────────────────
+        "mc_number": mc_number,
+        "dot_number": str(d.get("dot_number") or "").strip(),
+        "duns_number": d.get("dun_bradstreet_no"),
+
+        # ── Identity ─────────────────────────────────────────────────────
+        "legal_name": d.get("legal_name") or "",
+        "dba_name": d.get("dba_name"),
+        "entity_type": _derive_entity_type(classdef),
+        "status": _derive_status(status_code),
+
+        # ── Contact ──────────────────────────────────────────────────────
+        "email": d.get("email_address"),
+        "phone": _clean_phone(d.get("phone")),
+        "company_rep": company_rep,
+
+        # ── Location ─────────────────────────────────────────────────────
+        "physical_address": physical_address or None,
+        "mailing_address": mailing_address or None,
+        "phy_state": d.get("phy_state"),
+
+        # ── Compliance ───────────────────────────────────────────────────
+        "mcs150_date": _format_mcs150_date(d.get("mcs150_date")),
+        "mcs150_mileage": d.get("mcs150_mileage"),
+        "add_date": _format_add_date(d.get("add_date")),
+        "date_scraped": _format_add_date(d.get("add_date")),  # best proxy
+
+        # ── Operations ───────────────────────────────────────────────────
+        "operation_classification": _classdef_to_operation_classification(classdef),
+        "carrier_operation": _derive_carrier_operation(d),
+        "cargo_carried": _cargo_list_from_jsonb(cargo_raw),
+        "hm_ind": d.get("hm_ind") or "N",
+
+        # ── Fleet ────────────────────────────────────────────────────────
+        "power_units": d.get("power_units"),
+        "drivers": d.get("total_drivers"),
+
+        # ── Safety (enriched later) ───────────────────────────────────────
+        "safety_rating": None,
+        "safety_rating_date": None,
+        "basic_scores": None,
+        "oos_rates": None,
+        "out_of_service_date": None,
+        "state_carrier_id": None,
+        "inspections": None,
+        "crashes": None,
+
+        # ── Insurance (from carriers.insurance JSONB) ─────────────────────
+        "insurance_history_filings": _format_insurance_from_jsonb(insurance_raw),
+    }
+
+
+# ── Census carrier query ──────────────────────────────────────────────────────
+
+# Maps cargo filter label → key in cargo JSONB
+_CARGO_KEY_MAP = {
+    "General Freight": "General Freight",
+    "Household Goods": "Household Goods",
+    "Metal: Sheets, Coils, Rolls": "Metal: Sheets, Coils, Rolls",
+    "Motor Vehicles": "Motor Vehicles",
+    "Drive/Tow Away": "Drive/Tow Away",
+    "Logs, Poles, Beams, Lumber": "Logs, Poles, Beams, Lumber",
+    "Building Materials": "Building Materials",
+    "Mobile Homes": "Mobile Homes",
+    "Machinery, Large Objects": "Machinery, Large Objects",
+    "Fresh Produce": "Fresh Produce",
+    "Liquids/Gases": "Liquids/Gases",
+    "Intermodal Cont.": "Intermodal Cont.",
+    "Passengers": "Passengers",
+    "Oilfield Equipment": "Oilfield Equipment",
+    "Livestock": "Livestock",
+    "Grain, Feed, Hay": "Grain, Feed, Hay",
+    "Coal/Coke": "Coal/Coke",
+    "Meat": "Meat",
+    "Garbage/Refuse": "Garbage/Refuse",
+    "US Mail": "US Mail",
+    "Chemicals": "Chemicals",
+    "Commodities Dry Bulk": "Commodities Dry Bulk",
+    "Refrigerated Food": "Refrigerated Food",
+    "Beverages": "Beverages",
+    "Paper Products": "Paper Products",
+    "Utilities": "Utilities",
+    "Agricultural/Farm Supplies": "Agricultural/Farm Supplies",
+    "Construction": "Construction",
+    "Water Well": "Water Well",
+    "Other": "Other",
+}
+
+# Maps classdef fragment → filter-friendly label
+_CLASSDEF_FILTER_MAP = {
+    "Auth. For Hire": "AUTHORIZED FOR HIRE",
+    "Exempt For Hire": "EXEMPT FOR HIRE",
+    "Private(Property)": "PRIVATE(PROPERTY)",
+    "Private(Passenger)": "PRIVATE(PASSENGER)",
+    "Migrant": "MIGRANT",
+    "U.S. Mail": "U.S. MAIL",
+    "Federal Government": "FEDERAL GOVERNMENT",
+    "State Government": "STATE GOVERNMENT",
+    "Local Government": "LOCAL GOVERNMENT",
+    "Indian Tribe": "INDIAN TRIBE",
+}
+
+# Maps insurance type filter → ins_type_desc pattern inside carriers.insurance
+_INS_TYPE_PATTERN = {
+    "BI&PD": "BIPD",
+    "CARGO": "CARGO",
+    "BOND": "SURETY",
+    "TRUST FUND": "TRUST FUND",
+}
+
+_INSURANCE_COMPANY_PATTERNS: dict[str, list[str]] = {
+    "GREAT WEST CASUALTY": ["GREAT WEST"],
+    "UNITED FINANCIAL CASUALTY": ["UNITED FINANCIAL"],
+    "GEICO MARINE": ["GEICO MARINE"],
+    "NORTHLAND INSURANCE": ["NORTHLAND"],
+    "ARTISAN & TRUCKERS": ["ARTISAN", "TRUCKERS CASUALTY"],
+    "CANAL INSURANCE": ["CANAL INS"],
+    "PROGRESSIVE": ["PROGRESSIVE"],
+    "BERKSHIRE HATHAWAY": ["BERKSHIRE"],
+    "OLD REPUBLIC": ["OLD REPUBLIC"],
+    "SENTRY": ["SENTRY"],
+    "TRAVELERS": ["TRAVELERS"],
+}
+
+
+async def fetch_carriers(filters: dict) -> dict:
+    pool = get_pool()
+
+    conditions: list[str] = []
+    params: list = []
+    idx = 1
+
+    # ── Text search ──────────────────────────────────────────────────────────
+
+    if filters.get("mc_number"):
+        # dockets is a JSONB array like ["MC143680"]. Search for the MC value.
+        val = filters["mc_number"].strip().upper()
+        # Strip leading MC if user typed it
+        numeric = val.lstrip("MC").strip()
+        conditions.append(f"dockets::text ILIKE ${idx}")
+        params.append(f"%MC{numeric}%")
+        idx += 1
+
+    if filters.get("dot_number"):
+        conditions.append(f"dot_number = ${idx}")
+        params.append(str(filters["dot_number"]).strip())
+        idx += 1
+
+    if filters.get("legal_name"):
+        conditions.append(f"legal_name ILIKE ${idx}")
+        params.append(f"%{filters['legal_name']}%")
+        idx += 1
+
+    # ── Entity type (CARRIER vs BROKER) ──────────────────────────────────────
+    entity_type = filters.get("entity_type")
+    if entity_type:
+        et = entity_type.upper()
+        if et == "BROKER":
+            conditions.append("UPPER(classdef) LIKE '%BROKER%'")
+        elif et == "CARRIER":
+            conditions.append("(classdef IS NULL OR UPPER(classdef) NOT LIKE '%BROKER%')")
+
+    # ── Active / Inactive ────────────────────────────────────────────────────
+    active = filters.get("active")
+    if active == "true":
+        conditions.append("status_code = 'A'")
+    elif active == "false":
+        conditions.append("(status_code IS NULL OR status_code != 'A')")
+
+    # ── State ────────────────────────────────────────────────────────────────
+    if filters.get("state"):
+        states = filters["state"].split("|")
+        or_clauses = []
+        for s in states:
+            or_clauses.append(f"phy_state = ${idx}")
+            params.append(s.strip().upper())
+            idx += 1
+        conditions.append(f"({' OR '.join(or_clauses)})")
+
+    # ── Has email ────────────────────────────────────────────────────────────
+    has_email = filters.get("has_email")
+    if has_email == "true":
+        conditions.append("email_address IS NOT NULL AND email_address != ''")
+    elif has_email == "false":
+        conditions.append("(email_address IS NULL OR email_address = '')")
+
+    # ── Company rep (has company_officer_1) ──────────────────────────────────
+    has_company_rep = filters.get("has_company_rep")
+    if has_company_rep == "true":
+        conditions.append("company_officer_1 IS NOT NULL AND company_officer_1 != ''")
+    elif has_company_rep == "false":
+        conditions.append("(company_officer_1 IS NULL OR company_officer_1 = '')")
+
+    # ── BOC-3 — no direct Census column, skip gracefully ────────────────────
+    # (BOC-3 was only in the scraped data; Census doesn't have it)
+
+    # ── Years in Business (based on add_date stored as 'YYYYMMDD') ──────────
+    if filters.get("years_in_business_min"):
+        yrs = int(filters["years_in_business_min"])
+        conditions.append(
+            f"add_date IS NOT NULL AND add_date ~ '^[0-9]{{8}}$' "
+            f"AND (NOW()::date - TO_DATE(add_date, 'YYYYMMDD')) >= ${idx} * 365"
+        )
+        params.append(yrs)
+        idx += 1
+    if filters.get("years_in_business_max"):
+        yrs = int(filters["years_in_business_max"])
+        conditions.append(
+            f"add_date IS NOT NULL AND add_date ~ '^[0-9]{{8}}$' "
+            f"AND (NOW()::date - TO_DATE(add_date, 'YYYYMMDD')) <= ${idx} * 365"
+        )
+        params.append(yrs)
+        idx += 1
+
+    # ── Operation classification (classdef text contains fragment) ───────────
+    if filters.get("classification"):
+        classifications = filters["classification"]
+        if isinstance(classifications, str):
+            classifications = classifications.split(",")
+        or_clauses = []
+        for c in classifications:
+            key = _CLASSDEF_FILTER_MAP.get(c.strip(), c.strip().upper())
+            or_clauses.append(f"UPPER(classdef) LIKE ${idx}")
+            params.append(f"%{key}%")
+            idx += 1
+        conditions.append(f"({' OR '.join(or_clauses)})")
+
+    # ── Carrier operation (interstate/intrastate fields) ─────────────────────
+    if filters.get("carrier_operation"):
+        ops = filters["carrier_operation"]
+        if isinstance(ops, str):
+            ops = ops.split(",")
+        or_clauses = []
+        for op in ops:
+            op = op.strip()
+            if op == "Interstate":
+                or_clauses.append(
+                    "(NULLIF(interstate_beyond_100_miles,'')::numeric > 0 "
+                    "OR NULLIF(interstate_within_100_miles,'')::numeric > 0)"
+                )
+            elif op == "Intrastate Only (HM)":
+                or_clauses.append(
+                    "NULLIF(intrastate_beyond_100_miles,'')::numeric > 0"
+                )
+            elif op == "Intrastate Only (Non-HM)":
+                or_clauses.append(
+                    "NULLIF(intrastate_within_100_miles,'')::numeric > 0"
+                )
+        if or_clauses:
+            conditions.append(f"({' OR '.join(or_clauses)})")
+
+    # ── Hazmat ───────────────────────────────────────────────────────────────
+    hazmat = filters.get("hazmat")
+    if hazmat == "true":
+        conditions.append("hm_ind = 'Y'")
+    elif hazmat == "false":
+        conditions.append("(hm_ind IS NULL OR hm_ind != 'Y')")
+
+    # ── Power units ──────────────────────────────────────────────────────────
+    if filters.get("power_units_min"):
+        conditions.append(f"NULLIF(power_units,'')::numeric >= ${idx}")
+        params.append(int(filters["power_units_min"]))
+        idx += 1
+    if filters.get("power_units_max"):
+        conditions.append(f"NULLIF(power_units,'')::numeric <= ${idx}")
+        params.append(int(filters["power_units_max"]))
+        idx += 1
+
+    # ── Drivers ──────────────────────────────────────────────────────────────
+    if filters.get("drivers_min"):
+        conditions.append(f"NULLIF(total_drivers,'')::numeric >= ${idx}")
+        params.append(int(filters["drivers_min"]))
+        idx += 1
+    if filters.get("drivers_max"):
+        conditions.append(f"NULLIF(total_drivers,'')::numeric <= ${idx}")
+        params.append(int(filters["drivers_max"]))
+        idx += 1
+
+    # ── Cargo (JSONB key exists with value 'X') ───────────────────────────────
+    if filters.get("cargo"):
+        cargo_list = filters["cargo"]
+        if isinstance(cargo_list, str):
+            cargo_list = cargo_list.split(",")
+        or_clauses = []
+        for c in cargo_list:
+            key = _CARGO_KEY_MAP.get(c.strip(), c.strip())
+            or_clauses.append(f"cargo->${idx} = '\"X\"'::jsonb")
+            params.append(key)
+            idx += 1
+        conditions.append(f"({' OR '.join(or_clauses)})")
+
+    # ── Insurance filters — operate on carriers.insurance JSONB array ────────
+    # Helper: EXISTS subquery against jsonb_array_elements(insurance)
+
+    def _ins_exists(field_sql: str, op: str, param_placeholder: str) -> str:
+        return (
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance,'[]'::jsonb)) AS ins "
+            f"WHERE {field_sql} {op} {param_placeholder} "
+            f"AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = ''))"
+        )
+
+    def _ins_exists_raw(where_clause: str) -> str:
+        return (
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance,'[]'::jsonb)) AS ins "
+            f"WHERE {where_clause})"
+        )
+
+    # Insurance required types
+    if filters.get("insurance_required"):
+        ins_types = filters["insurance_required"]
+        if isinstance(ins_types, str):
+            ins_types = ins_types.split(",")
+        or_clauses = []
+        for itype in ins_types:
+            pattern = _INS_TYPE_PATTERN.get(itype.strip(), itype.strip())
+            or_clauses.append(
+                _ins_exists_raw(
+                    f"UPPER(ins->>'ins_type_desc') LIKE ${idx} "
+                    f"AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '')"
+                )
+            )
+            params.append(f"{pattern}%")
+            idx += 1
+        conditions.append(f"({' OR '.join(or_clauses)})")
+
+    # BIPD on file
+    bipd_on_file = filters.get("bipd_on_file")
+    if bipd_on_file == "1":
+        conditions.append(
+            _ins_exists_raw(
+                f"UPPER(ins->>'ins_type_desc') LIKE 'BIPD%' "
+                f"AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '')"
+            )
+        )
+    elif bipd_on_file == "0":
+        conditions.append(
+            f"NOT {_ins_exists_raw('UPPER(ins->>''ins_type_desc'') LIKE ''BIPD%'' AND (ins->>''cancl_effective_date'' IS NULL OR ins->>''cancl_effective_date'' = '''')')}"
+        )
+
+    # Cargo on file
+    cargo_on_file = filters.get("cargo_on_file")
+    if cargo_on_file == "1":
+        conditions.append(
+            _ins_exists_raw(
+                "UPPER(ins->>'ins_type_desc') = 'CARGO' "
+                "AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '')"
+            )
+        )
+    elif cargo_on_file == "0":
+        conditions.append(
+            "NOT " + _ins_exists_raw(
+                "UPPER(ins->>'ins_type_desc') = 'CARGO' "
+                "AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '')"
+            )
+        )
+
+    # Bond on file
+    bond_on_file = filters.get("bond_on_file")
+    if bond_on_file == "1":
+        conditions.append(
+            _ins_exists_raw(
+                "UPPER(ins->>'ins_type_desc') LIKE 'SURETY%' "
+                "AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '')"
+            )
+        )
+    elif bond_on_file == "0":
+        conditions.append(
+            "NOT " + _ins_exists_raw(
+                "UPPER(ins->>'ins_type_desc') LIKE 'SURETY%' "
+                "AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '')"
+            )
+        )
+
+    # Trust fund on file
+    trust_fund_on_file = filters.get("trust_fund_on_file")
+    if trust_fund_on_file == "1":
+        conditions.append(
+            _ins_exists_raw(
+                "UPPER(ins->>'ins_type_desc') LIKE 'TRUST FUND%' "
+                "AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '')"
+            )
+        )
+    elif trust_fund_on_file == "0":
+        conditions.append(
+            "NOT " + _ins_exists_raw(
+                "UPPER(ins->>'ins_type_desc') LIKE 'TRUST FUND%' "
+                "AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '')"
+            )
+        )
+
+    # BIPD coverage amount (max_cov_amount stored in thousands)
+    if filters.get("bipd_min"):
+        raw_min = int(filters["bipd_min"])
+        compare_min = raw_min // 1000 if raw_min >= 10000 else raw_min
+        conditions.append(
+            _ins_exists_raw(
+                f"UPPER(ins->>'ins_type_desc') LIKE 'BIPD%' "
+                f"AND NULLIF(REPLACE(ins->>'max_cov_amount',',',''),'')::numeric >= ${idx}"
+            )
+        )
+        params.append(compare_min)
+        idx += 1
+    if filters.get("bipd_max"):
+        raw_max = int(filters["bipd_max"])
+        compare_max = raw_max // 1000 if raw_max >= 10000 else raw_max
+        conditions.append(
+            _ins_exists_raw(
+                f"UPPER(ins->>'ins_type_desc') LIKE 'BIPD%' "
+                f"AND NULLIF(REPLACE(ins->>'max_cov_amount',',',''),'')::numeric <= ${idx}"
+            )
+        )
+        params.append(compare_max)
+        idx += 1
+
+    # Insurance effective date (MM/DD/YYYY stored)
+    if filters.get("ins_effective_date_from"):
+        parts = filters["ins_effective_date_from"].split("-")
+        date_db = f"{parts[1]}/{parts[2]}/{parts[0]}"
+        conditions.append(
+            _ins_exists_raw(
+                f"ins->>'effective_date' IS NOT NULL "
+                f"AND ins->>'effective_date' LIKE '%/%/%' "
+                f"AND TO_DATE(ins->>'effective_date','MM/DD/YYYY') >= TO_DATE(${idx},'MM/DD/YYYY')"
+            )
+        )
+        params.append(date_db)
+        idx += 1
+    if filters.get("ins_effective_date_to"):
+        parts = filters["ins_effective_date_to"].split("-")
+        date_db = f"{parts[1]}/{parts[2]}/{parts[0]}"
+        conditions.append(
+            _ins_exists_raw(
+                f"ins->>'effective_date' IS NOT NULL "
+                f"AND ins->>'effective_date' LIKE '%/%/%' "
+                f"AND TO_DATE(ins->>'effective_date','MM/DD/YYYY') <= TO_DATE(${idx},'MM/DD/YYYY')"
+            )
+        )
+        params.append(date_db)
+        idx += 1
+
+    # Insurance cancellation date
+    if filters.get("ins_cancellation_date_from"):
+        parts = filters["ins_cancellation_date_from"].split("-")
+        date_db = f"{parts[1]}/{parts[2]}/{parts[0]}"
+        conditions.append(
+            _ins_exists_raw(
+                f"ins->>'cancl_effective_date' IS NOT NULL "
+                f"AND ins->>'cancl_effective_date' != '' "
+                f"AND ins->>'cancl_effective_date' LIKE '%/%/%' "
+                f"AND TO_DATE(ins->>'cancl_effective_date','MM/DD/YYYY') >= TO_DATE(${idx},'MM/DD/YYYY')"
+            )
+        )
+        params.append(date_db)
+        idx += 1
+    if filters.get("ins_cancellation_date_to"):
+        parts = filters["ins_cancellation_date_to"].split("-")
+        date_db = f"{parts[1]}/{parts[2]}/{parts[0]}"
+        conditions.append(
+            _ins_exists_raw(
+                f"ins->>'cancl_effective_date' IS NOT NULL "
+                f"AND ins->>'cancl_effective_date' != '' "
+                f"AND ins->>'cancl_effective_date' LIKE '%/%/%' "
+                f"AND TO_DATE(ins->>'cancl_effective_date','MM/DD/YYYY') <= TO_DATE(${idx},'MM/DD/YYYY')"
+            )
+        )
+        params.append(date_db)
+        idx += 1
+
+    # Insurance company filter
+    if filters.get("insurance_company"):
+        companies = filters["insurance_company"]
+        if isinstance(companies, str):
+            companies = companies.split(",")
+        or_clauses = []
+        for company in companies:
+            company_upper = company.strip().upper()
+            patterns = _INSURANCE_COMPANY_PATTERNS.get(company_upper, [company_upper])
+            for pattern in patterns:
+                or_clauses.append(
+                    _ins_exists_raw(
+                        f"UPPER(ins->>'name_company') LIKE ${idx} "
+                        f"AND (ins->>'cancl_effective_date' IS NULL "
+                        f"OR ins->>'cancl_effective_date' = '' "
+                        f"OR (ins->>'cancl_effective_date' LIKE '%/%/%' "
+                        f"AND TO_DATE(ins->>'cancl_effective_date','MM/DD/YYYY') >= CURRENT_DATE))"
+                    )
+                )
+                params.append(f"%{pattern}%")
+                idx += 1
+        conditions.append(f"({' OR '.join(or_clauses)})")
+
+    # Renewal policy months
+    def _renewal_case(eff_field: str) -> str:
+        return f"""
+          CASE
+            WHEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                 EXTRACT(MONTH FROM TO_DATE({eff_field},'MM/DD/YYYY'))::int,
+                 LEAST(EXTRACT(DAY FROM TO_DATE({eff_field},'MM/DD/YYYY'))::int,
+                   EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                     EXTRACT(MONTH FROM TO_DATE({eff_field},'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int))
+                 >= CURRENT_DATE
+            THEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                 EXTRACT(MONTH FROM TO_DATE({eff_field},'MM/DD/YYYY'))::int,
+                 LEAST(EXTRACT(DAY FROM TO_DATE({eff_field},'MM/DD/YYYY'))::int,
+                   EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                     EXTRACT(MONTH FROM TO_DATE({eff_field},'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int))
+            ELSE MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1,
+                 EXTRACT(MONTH FROM TO_DATE({eff_field},'MM/DD/YYYY'))::int,
+                 LEAST(EXTRACT(DAY FROM TO_DATE({eff_field},'MM/DD/YYYY'))::int,
+                   EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1,
+                     EXTRACT(MONTH FROM TO_DATE({eff_field},'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int))
+          END
+        """
+
+    if filters.get("renewal_policy_months"):
+        months = int(filters["renewal_policy_months"])
+        eff = "ins->>'effective_date'"
+        conditions.append(
+            _ins_exists_raw(
+                f"{eff} IS NOT NULL AND {eff} LIKE '%/%/%' "
+                f"AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '' "
+                f"OR (ins->>'cancl_effective_date' LIKE '%/%/%' AND TO_DATE(ins->>'cancl_effective_date','MM/DD/YYYY') >= CURRENT_DATE)) "
+                f"AND {_renewal_case(eff)} BETWEEN CURRENT_DATE "
+                f"AND (DATE_TRUNC('MONTH', CURRENT_DATE + MAKE_INTERVAL(months => ${idx})) + INTERVAL '1 MONTH - 1 DAY')::date"
+            )
+        )
+        params.append(months)
+        idx += 1
+
+    if filters.get("renewal_date_from"):
+        parts = filters["renewal_date_from"].split("-")
+        date_db = f"{parts[1]}/{parts[2]}/{parts[0]}"
+        eff = "ins->>'effective_date'"
+        conditions.append(
+            _ins_exists_raw(
+                f"{eff} IS NOT NULL AND {eff} LIKE '%/%/%' "
+                f"AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '' "
+                f"OR (ins->>'cancl_effective_date' LIKE '%/%/%' AND TO_DATE(ins->>'cancl_effective_date','MM/DD/YYYY') >= CURRENT_DATE)) "
+                f"AND {_renewal_case(eff)} >= TO_DATE(${idx},'MM/DD/YYYY')"
+            )
+        )
+        params.append(date_db)
+        idx += 1
+
+    if filters.get("renewal_date_to"):
+        parts = filters["renewal_date_to"].split("-")
+        date_db = f"{parts[1]}/{parts[2]}/{parts[0]}"
+        eff = "ins->>'effective_date'"
+        conditions.append(
+            _ins_exists_raw(
+                f"{eff} IS NOT NULL AND {eff} LIKE '%/%/%' "
+                f"AND (ins->>'cancl_effective_date' IS NULL OR ins->>'cancl_effective_date' = '' "
+                f"OR (ins->>'cancl_effective_date' LIKE '%/%/%' AND TO_DATE(ins->>'cancl_effective_date','MM/DD/YYYY') >= CURRENT_DATE)) "
+                f"AND {_renewal_case(eff)} <= TO_DATE(${idx},'MM/DD/YYYY')"
+            )
+        )
+        params.append(date_db)
+        idx += 1
+
+    # ── Build final query ─────────────────────────────────────────────────────
+    where = " AND ".join(conditions) if conditions else "TRUE"
+
+    is_filtered = len(conditions) > 0
+    limit_val = int(filters.get("limit", 500 if is_filtered else 200))
+    offset_val = int(filters.get("offset", 0))
+
+    query = f"""
+        SELECT
+            dot_number, legal_name, dba_name, status_code, classdef,
+            email_address, phone, company_officer_1, company_officer_2,
+            phy_street, phy_city, phy_state, phy_zip,
+            carrier_mailing_street, carrier_mailing_city, carrier_mailing_state, carrier_mailing_zip,
+            mcs150_date, mcs150_mileage, add_date,
+            power_units, total_drivers,
+            interstate_beyond_100_miles, interstate_within_100_miles,
+            intrastate_beyond_100_miles, intrastate_within_100_miles,
+            hm_ind, dun_bradstreet_no,
+            dockets, cargo, insurance
+        FROM carriers
+        WHERE {where}
+        ORDER BY legal_name ASC
+        LIMIT {limit_val} OFFSET {offset_val}
+    """
+
+    count_query = f"SELECT COUNT(*) AS cnt FROM carriers WHERE {where}"
+
+    try:
+        rows, count_row = await asyncio.gather(
+            pool.fetch(query, *params),
+            pool.fetchrow(count_query, *params),
+        )
+        filtered_count = count_row["cnt"] if count_row else 0
+        return {
+            "data": [_carrier_row_to_dict(row) for row in rows],
+            "filtered_count": filtered_count,
+        }
+    except Exception as e:
+        print(f"[DB] Error fetching carriers: {e}")
+        return {"data": [], "filtered_count": 0}
+
+
+async def delete_carrier(mc_number: str) -> bool:
+    """Delete by dot_number (mc_number is now the dot_number proxy for deletions)."""
+    pool = get_pool()
+    try:
+        result = await pool.execute(
+            "DELETE FROM carriers WHERE dot_number = $1", mc_number
+        )
+        return not result.endswith("0")
+    except Exception as e:
+        print(f"[DB] Error deleting carrier {mc_number}: {e}")
+        return False
+
+
+async def get_carrier_count() -> int:
+    pool = get_pool()
+    try:
+        row = await pool.fetchrow("SELECT COUNT(*) as cnt FROM carriers")
+        return row["cnt"] if row else 0
+    except Exception as e:
+        print(f"[DB] Error getting carrier count: {e}")
+        return 0
+
+
+async def get_carrier_dashboard_stats() -> dict:
+    pool = get_pool()
+    empty = {
+        "total": 0, "active_carriers": 0, "brokers": 0,
+        "with_email": 0, "email_rate": "0",
+        "with_safety_rating": 0, "with_insurance": 0,
+        "with_inspections": 0, "with_crashes": 0,
+        "not_authorized": 0, "other": 0,
+    }
+    try:
+        row = await pool.fetchrow("""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE status_code = 'A') AS active_carriers,
+                COUNT(*) FILTER (WHERE UPPER(classdef) LIKE '%BROKER%') AS brokers,
+                COUNT(*) FILTER (WHERE email_address IS NOT NULL AND email_address != '') AS with_email,
+                COUNT(*) FILTER (WHERE status_code != 'A' OR status_code IS NULL) AS not_authorized,
+                COUNT(*) FILTER (WHERE insurance IS NOT NULL AND jsonb_array_length(insurance) > 0) AS with_insurance
+            FROM carriers
+        """)
+        if not row:
+            return empty
+        total = row["total"]
+        active = row["active_carriers"]
+        not_auth = row["not_authorized"]
+        with_email = row["with_email"]
+        email_rate = f"{(with_email / total * 100):.1f}" if total > 0 else "0"
+        return {
+            "total": total,
+            "active_carriers": active,
+            "brokers": row["brokers"],
+            "with_email": with_email,
+            "email_rate": email_rate,
+            "with_safety_rating": 0,  # not in Census data
+            "with_insurance": row["with_insurance"],
+            "with_inspections": 0,    # not in Census data
+            "with_crashes": 0,        # not in Census data
+            "not_authorized": not_auth,
+            "other": total - active - not_auth,
+        }
+    except Exception as e:
+        print(f"[DB] Error getting dashboard stats: {e}")
+        return empty
+
+
+async def update_carrier_insurance(dot_number: str, policies: list) -> bool:
+    pool = get_pool()
+    try:
+        result = await pool.execute(
+            "UPDATE carriers SET insurance = $1 WHERE dot_number = $2",
+            _to_jsonb(policies),
+            dot_number,
+        )
+        return not result.endswith("0")
+    except Exception as e:
+        print(f"[DB] Error updating insurance for DOT {dot_number}: {e}")
+        return False
+
+
+async def update_carrier_safety(dot_number: str, safety_data: dict) -> bool:
+    """Safety data (rating, basic scores etc.) are not in the Census table.
+    This is a no-op placeholder kept for API compatibility."""
+    print(f"[DB] update_carrier_safety called for DOT {dot_number} — Census table has no safety columns")
+    return False
+
+
+async def get_carriers_by_mc_range(start: str, end: str) -> list[dict]:
+    pool = get_pool()
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT dot_number, legal_name, dba_name, status_code, classdef,
+                email_address, phone, company_officer_1, company_officer_2,
+                phy_street, phy_city, phy_state, phy_zip,
+                carrier_mailing_street, carrier_mailing_city, carrier_mailing_state, carrier_mailing_zip,
+                mcs150_date, mcs150_mileage, add_date,
+                power_units, total_drivers,
+                interstate_beyond_100_miles, interstate_within_100_miles,
+                intrastate_beyond_100_miles, intrastate_within_100_miles,
+                hm_ind, dun_bradstreet_no, dockets, cargo, insurance
+            FROM carriers
+            WHERE temp >= $1 AND temp <= $2
+            ORDER BY temp ASC
+            """,
+            int(start),
+            int(end),
+        )
+        return [_carrier_row_to_dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB] Error fetching MC range: {e}")
+        return []
+
+
+async def fetch_insurance_history(mc_number: str) -> list[dict]:
+    """
+    Insurance is now in carriers.insurance JSONB, not a separate table.
+    Fetch by dot_number or by MC number via the dockets column.
+    """
+    pool = get_pool()
+    try:
+        # Try to find via dockets column
+        row = await pool.fetchrow(
+            """
+            SELECT insurance FROM carriers
+            WHERE dockets::text ILIKE $1
+            LIMIT 1
+            """,
+            f"%MC{mc_number}%",
+        )
+        if not row:
+            return []
+        return _format_insurance_from_jsonb(row["insurance"])
+    except Exception as e:
+        print(f"[DB] Error fetching insurance history for MC {mc_number}: {e}")
+        return []
+
+
+# ── FMCSA Register ────────────────────────────────────────────────────────────
 
 async def save_fmcsa_register_entries(entries: list[dict], extracted_date: str) -> dict:
     pool = get_pool()
@@ -335,7 +1278,6 @@ async def save_fmcsa_register_entries(entries: list[dict], extracted_date: str) 
         return {"success": True, "saved": 0, "skipped": 0}
 
     saved = 0
-    skipped = 0
     batch_size = 500
     try:
         async with pool.acquire() as conn:
@@ -367,9 +1309,8 @@ async def save_fmcsa_register_entries(entries: list[dict], extracted_date: str) 
                     saved += len(batch)
     except Exception as e:
         print(f"[DB] Error batch-saving FMCSA entries: {e}")
-        skipped = len(entries) - saved
 
-    return {"success": True, "saved": saved, "skipped": skipped}
+    return {"success": True, "saved": saved, "skipped": len(entries) - saved}
 
 
 async def fetch_fmcsa_register_by_date(
@@ -378,7 +1319,6 @@ async def fetch_fmcsa_register_by_date(
     search_term: Optional[str] = None,
 ) -> list[dict]:
     pool = get_pool()
-
     conditions = ["date_fetched = $1"]
     params: list = [extracted_date]
     idx = 2
@@ -387,22 +1327,16 @@ async def fetch_fmcsa_register_by_date(
         conditions.append(f"category = ${idx}")
         params.append(category)
         idx += 1
-
     if search_term:
         conditions.append(f"(title ILIKE ${idx} OR number ILIKE ${idx})")
         params.append(f"%{search_term}%")
         idx += 1
 
     where = " AND ".join(conditions)
-    query = f"""
-        SELECT number, title, decided, category, date_fetched
-        FROM fmcsa_register
-        WHERE {where}
-        ORDER BY number
-        LIMIT 10000
-    """
-
-    rows = await pool.fetch(query, *params)
+    rows = await pool.fetch(
+        f"SELECT number, title, decided, category, date_fetched FROM fmcsa_register WHERE {where} ORDER BY number LIMIT 10000",
+        *params,
+    )
     return [dict(row) for row in rows]
 
 
@@ -439,860 +1373,7 @@ async def delete_fmcsa_entries_before_date(date: str) -> int:
         return 0
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _to_jsonb(value) -> Optional[str]:
-    if value is None:
-        return None
-    return json.dumps(value)
-
-
-def _parse_jsonb(value) -> Optional[object]:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            return value
-    return value
-
-
-# ── Carrier helpers (Census schema) ─────────────────────────────────────────
-
-def _format_embedded_insurance(raw_insurance) -> list[dict]:
-    """Format the embedded insurance JSONB array from Census data."""
-    parsed = _parse_jsonb(raw_insurance)
-    if not parsed or not isinstance(parsed, list):
-        return []
-    results = []
-    for row in parsed:
-        if not isinstance(row, dict):
-            continue
-        raw_amount = str(row.get("max_cov_amount") or "").strip()
-        try:
-            amount_int = int(raw_amount) * 1000
-            coverage = f"${amount_int:,}"
-        except (ValueError, TypeError):
-            coverage = raw_amount or "N/A"
-        cancl = str(row.get("cancl_effective_date") or "").strip()
-        results.append({
-            "type": str(row.get("ins_type_desc") or "").strip(),
-            "coverageAmount": coverage,
-            "policyNumber": str(row.get("policy_no") or "").strip(),
-            "effectiveDate": str(row.get("effective_date") or "").strip(),
-            "carrier": str(row.get("name_company") or "").strip(),
-            "formCode": str(row.get("ins_form_code") or "").strip(),
-            "transDate": str(row.get("trans_date") or "").strip(),
-            "underlLimAmount": str(row.get("underl_lim_amount") or "").strip(),
-            "canclEffectiveDate": cancl,
-            "status": "Cancelled" if cancl else "Active",
-        })
-    return results
-
-
-def _build_mc_number(row) -> str:
-    """Extract MC number from dockets JSONB or temp column."""
-    dockets = _parse_jsonb(row.get("dockets"))
-    if dockets and isinstance(dockets, list):
-        for d in dockets:
-            ds = str(d) if d else ""
-            if ds.upper().startswith("MC"):
-                return ds[2:]
-    temp = row.get("temp")
-    if temp is not None:
-        return str(temp)
-    return ""
-
-
-def _build_carrier_operation_display(code: str) -> str:
-    """Convert single-char carrier_operation to display string."""
-    if not code:
-        return ""
-    code = code.strip().upper()
-    mapping = {"A": "Interstate", "B": "Intrastate Only (HM)", "C": "Intrastate Only (Non-HM)"}
-    return mapping.get(code, code)
-
-
-def _build_cargo_list(cargo_jsonb) -> list[str]:
-    """Convert Census cargo JSONB object to list of cargo type names."""
-    parsed = _parse_jsonb(cargo_jsonb)
-    if not parsed or not isinstance(parsed, dict):
-        return []
-    _CARGO_MAP = {
-        "genfreight": "General Freight", "household": "Household Goods",
-        "metalsheet": "Metal: Sheets, Coils, Rolls", "motorveh": "Motor Vehicles",
-        "drivetow": "Drive/Tow Away", "logpole": "Logs, Poles, Beams, Lumber",
-        "bldgmat": "Building Materials", "mobilehome": "Mobile Homes",
-        "machlrg": "Machinery, Large Objects", "produce": "Fresh Produce",
-        "liqgas": "Liquids/Gases", "intermodal": "Intermodal Cont.",
-        "passengers": "Passengers", "oilfield": "Oilfield Equipment",
-        "livestock": "Livestock", "grainfeed": "Grain, Feed, Hay",
-        "coalcoke": "Coal/Coke", "meat": "Meat",
-        "garbage": "Garbage/Refuse", "usmail": "US Mail",
-        "chem": "Chemicals", "drybulk": "Commodities Dry Bulk",
-        "coldfood": "Refrigerated Food", "beverages": "Beverages",
-        "paperprod": "Paper Products", "utility": "Utilities",
-        "farmsupp": "Agricultural/Farm Supplies", "construct": "Construction",
-        "waterwell": "Water Well", "cargoothr": "Other",
-    }
-    result = []
-    for key, val in parsed.items():
-        if val and str(val).strip().upper() == "X":
-            result.append(_CARGO_MAP.get(key, key))
-    return result
-
-
-def _build_classdef_list(classdef: str) -> list[str]:
-    """Convert semicolon-separated classdef string to list."""
-    if not classdef:
-        return []
-    return [c.strip() for c in classdef.split(";") if c.strip()]
-
-
-def _carrier_row_to_dict(row) -> dict:
-    """Convert a Census carriers row to the API response dict."""
-    d = dict(row)
-
-    mc_number = _build_mc_number(d)
-    cargo_list = _build_cargo_list(d.get("cargo"))
-    classdef_list = _build_classdef_list(d.get("classdef"))
-    carrier_op_display = _build_carrier_operation_display(d.get("carrier_operation"))
-    insurance_filings = _format_embedded_insurance(d.get("insurance"))
-
-    # Build physical address string
-    parts = []
-    if d.get("phy_street"):
-        parts.append(d["phy_street"].strip())
-    city_state = []
-    if d.get("phy_city"):
-        city_state.append(d["phy_city"].strip())
-    if d.get("phy_state"):
-        city_state.append(d["phy_state"].strip())
-    if city_state:
-        parts.append(", ".join(city_state))
-    if d.get("phy_zip"):
-        parts.append(d["phy_zip"].strip())
-    physical_address = ", ".join(parts) if parts else ""
-
-    # Build mailing address string
-    mparts = []
-    if d.get("mai_street"):
-        mparts.append(d["mai_street"].strip())
-    mcity_state = []
-    if d.get("mai_city"):
-        mcity_state.append(d["mai_city"].strip())
-    if d.get("mai_state"):
-        mcity_state.append(d["mai_state"].strip())
-    if mcity_state:
-        mparts.append(", ".join(mcity_state))
-    if d.get("mai_zip"):
-        mparts.append(d["mai_zip"].strip())
-    mailing_address = ", ".join(mparts) if mparts else ""
-
-    # Company rep from company_rep_1 / company_rep_2
-    reps = []
-    if d.get("company_rep_1"):
-        reps.append(d["company_rep_1"].strip())
-    if d.get("company_rep_2"):
-        reps.append(d["company_rep_2"].strip())
-    company_rep = "; ".join(reps) if reps else ""
-
-    # Status display
-    status_code = (d.get("status_code") or "").strip()
-    status_map = {"A": "Active/Authorized", "N": "Not Authorized"}
-    status_display = status_map.get(status_code, status_code)
-
-    result = {
-        "mc_number": mc_number,
-        "dot_number": d.get("dot_number") or "",
-        "legal_name": d.get("legal_name") or "",
-        "dba_name": d.get("dba_name") or "",
-        "status": status_display,
-        "status_code": status_code,
-        "email": d.get("email_address") or "",
-        "phone": d.get("phy_phone") or "",
-        "power_units": d.get("nbr_power_unit") or "",
-        "drivers": d.get("driver_total") or "",
-        "physical_address": physical_address,
-        "mailing_address": mailing_address,
-        "mcs150_date": d.get("mcs150_date") or "",
-        "mcs150_mileage": d.get("mcs150_mileage") or "",
-        "mcs150_mileage_year": d.get("mcs150_mileage_year") or "",
-        "operation_classification": classdef_list,
-        "carrier_operation": [carrier_op_display] if carrier_op_display else [],
-        "carrier_operation_code": (d.get("carrier_operation") or "").strip(),
-        "cargo_carried": cargo_list,
-        "duns_number": d.get("dun_bradstreet_no") or "",
-        "safety_rating": d.get("safety_rating") or "",
-        "safety_rating_date": d.get("safety_rating_date") or "",
-        "hm_ind": (d.get("hm_ind") or "").strip(),
-        "company_rep": company_rep,
-        "add_date": d.get("add_date") or "",
-        "phy_state": (d.get("phy_state") or "").strip(),
-        "phy_city": (d.get("phy_city") or "").strip(),
-        "total_cdl": d.get("total_cdl") or "",
-        "owntruck": d.get("owntruck") or "",
-        "owntract": d.get("owntract") or "",
-        "owntrail": d.get("owntrail") or "",
-        "bipd_file": (d.get("bipd_file") or "").strip(),
-        "cargo_file": (d.get("cargo_file") or "").strip(),
-        "bond_file": (d.get("bond_file") or "").strip(),
-        "insurance_history_filings": insurance_filings,
-    }
-    return result
-
-
-# ── Carrier query functions (Census schema) ─────────────────────────────────
-
-# Columns to SELECT for carrier list queries — only what we need
-_CARRIER_SELECT_COLS = """
-    dot_number, legal_name, dba_name, status_code,
-    email_address, phy_phone, nbr_power_unit, driver_total,
-    phy_street, phy_city, phy_state, phy_zip,
-    mai_street, mai_city, mai_state, mai_zip,
-    mcs150_date, mcs150_mileage, mcs150_mileage_year,
-    classdef, carrier_operation, cargo, dockets, temp,
-    dun_bradstreet_no, safety_rating, safety_rating_date,
-    hm_ind, company_rep_1, company_rep_2, add_date,
-    total_cdl, owntruck, owntract, owntrail,
-    bipd_file, cargo_file, bond_file,
-    insurance
-"""
-
-# Reverse mapping from display cargo name to Census JSONB key
-_CARGO_NAME_TO_KEY = {
-    "General Freight": "genfreight", "Household Goods": "household",
-    "Metal: Sheets, Coils, Rolls": "metalsheet", "Motor Vehicles": "motorveh",
-    "Drive/Tow Away": "drivetow", "Logs, Poles, Beams, Lumber": "logpole",
-    "Building Materials": "bldgmat", "Mobile Homes": "mobilehome",
-    "Machinery, Large Objects": "machlrg", "Fresh Produce": "produce",
-    "Liquids/Gases": "liqgas", "Intermodal Cont.": "intermodal",
-    "Passengers": "passengers", "Oilfield Equipment": "oilfield",
-    "Livestock": "livestock", "Grain, Feed, Hay": "grainfeed",
-    "Coal/Coke": "coalcoke", "Meat": "meat",
-    "Garbage/Refuse": "garbage", "US Mail": "usmail",
-    "Chemicals": "chem", "Commodities Dry Bulk": "drybulk",
-    "Refrigerated Food": "coldfood", "Beverages": "beverages",
-    "Paper Products": "paperprod", "Utilities": "utility",
-    "Agricultural/Farm Supplies": "farmsupp", "Construction": "construct",
-    "Water Well": "waterwell", "Other": "cargoothr",
-}
-
-# Map carrier operation display names to Census single-char codes
-_CARRIER_OP_TO_CODE = {
-    "Interstate": "A",
-    "Intrastate Only (HM)": "B",
-    "Intrastate Only (Non-HM)": "C",
-}
-
-
-async def fetch_carriers(filters: dict) -> dict:
-    pool = get_pool()
-
-    conditions: list[str] = []
-    params: list = []
-    idx = 1
-
-    # MC/MX Number — search dockets JSONB text and temp bigint column
-    if filters.get("mc_number"):
-        mc_val = filters["mc_number"].strip()
-        conditions.append(f"(temp::text ILIKE ${idx} OR dockets::text ILIKE ${idx})")
-        params.append(f"%{mc_val}%")
-        idx += 1
-
-    # USDOT Number
-    if filters.get("dot_number"):
-        conditions.append(f"dot_number ILIKE ${idx}")
-        params.append(f"%{filters['dot_number']}%")
-        idx += 1
-
-    # Legal Name
-    if filters.get("legal_name"):
-        conditions.append(f"legal_name ILIKE ${idx}")
-        params.append(f"%{filters['legal_name']}%")
-        idx += 1
-
-    # DUNS Number
-    if filters.get("duns_number"):
-        conditions.append(f"dun_bradstreet_no ILIKE ${idx}")
-        params.append(f"%{filters['duns_number']}%")
-        idx += 1
-
-    # Active/Authorized status
-    active = filters.get("active")
-    if active == "true":
-        conditions.append("status_code = 'A'")
-    elif active == "false":
-        conditions.append("status_code != 'A'")
-
-    # Years in Business (from add_date in YYYYMMDD format)
-    if filters.get("years_in_business_min"):
-        yrs = int(filters["years_in_business_min"])
-        conditions.append(
-            f"add_date IS NOT NULL AND add_date != '' AND LENGTH(add_date) = 8 "
-            f"AND TO_DATE(add_date, 'YYYYMMDD') <= (CURRENT_DATE - MAKE_INTERVAL(years => ${idx}))"
-        )
-        params.append(yrs)
-        idx += 1
-    if filters.get("years_in_business_max"):
-        yrs = int(filters["years_in_business_max"])
-        conditions.append(
-            f"add_date IS NOT NULL AND add_date != '' AND LENGTH(add_date) = 8 "
-            f"AND TO_DATE(add_date, 'YYYYMMDD') >= (CURRENT_DATE - MAKE_INTERVAL(years => ${idx}))"
-        )
-        params.append(yrs)
-        idx += 1
-
-    # State filter — use phy_state column directly (exact match, indexed)
-    if filters.get("state"):
-        states = [s.strip().upper() for s in filters["state"].split("|") if s.strip()]
-        if len(states) == 1:
-            conditions.append(f"phy_state = ${idx}")
-            params.append(states[0])
-            idx += 1
-        elif states:
-            placeholders = ", ".join(f"${idx + i}" for i in range(len(states)))
-            conditions.append(f"phy_state IN ({placeholders})")
-            for s in states:
-                params.append(s)
-                idx += 1
-
-    # Has Email
-    has_email = filters.get("has_email")
-    if has_email == "true":
-        conditions.append("email_address IS NOT NULL AND email_address != ''")
-    elif has_email == "false":
-        conditions.append("(email_address IS NULL OR email_address = '')")
-
-    # Has Company Rep
-    has_company_rep = filters.get("has_company_rep")
-    if has_company_rep == "true":
-        conditions.append("(company_rep_1 IS NOT NULL AND company_rep_1 != '')")
-    elif has_company_rep == "false":
-        conditions.append("(company_rep_1 IS NULL OR company_rep_1 = '')")
-
-    # Phone filter
-    if filters.get("phone"):
-        conditions.append(f"phy_phone ILIKE ${idx}")
-        params.append(f"%{filters['phone']}%")
-        idx += 1
-
-    # Email filter (specific email search)
-    if filters.get("email"):
-        conditions.append(f"email_address ILIKE ${idx}")
-        params.append(f"%{filters['email']}%")
-        idx += 1
-
-    # Operation Classification (classdef is semicolon-separated string)
-    if filters.get("classification"):
-        classifications = filters["classification"]
-        if isinstance(classifications, str):
-            classifications = classifications.split(",")
-        or_clauses = []
-        for cls in classifications:
-            or_clauses.append(f"classdef ILIKE ${idx}")
-            params.append(f"%{cls.strip()}%")
-            idx += 1
-        conditions.append(f"({' OR '.join(or_clauses)})")
-
-    # Carrier Operation (single char: A=Interstate, B=Intra HM, C=Intra Non-HM)
-    if filters.get("carrier_operation"):
-        ops = filters["carrier_operation"]
-        if isinstance(ops, str):
-            ops = ops.split(",")
-        codes = []
-        for op in ops:
-            op_stripped = op.strip()
-            code = _CARRIER_OP_TO_CODE.get(op_stripped, op_stripped)
-            codes.append(code)
-        if len(codes) == 1:
-            conditions.append(f"carrier_operation = ${idx}")
-            params.append(codes[0])
-            idx += 1
-        elif codes:
-            placeholders = ", ".join(f"${idx + i}" for i in range(len(codes)))
-            conditions.append(f"carrier_operation IN ({placeholders})")
-            for c in codes:
-                params.append(c)
-                idx += 1
-
-    # Cargo filter (cargo is JSONB object with keys like "genfreight": "X")
-    if filters.get("cargo"):
-        cargo_names = filters["cargo"]
-        if isinstance(cargo_names, str):
-            cargo_names = cargo_names.split(",")
-        cargo_keys = []
-        for name in cargo_names:
-            key = _CARGO_NAME_TO_KEY.get(name.strip(), name.strip().lower())
-            cargo_keys.append(key)
-        # Use JSONB ?| operator: cargo has any of these keys
-        conditions.append(f"cargo ?| ${idx}::text[]")
-        params.append(cargo_keys)
-        idx += 1
-
-    # Hazmat indicator
-    hazmat = filters.get("hazmat")
-    if hazmat == "true":
-        conditions.append("hm_ind = 'Y'")
-    elif hazmat == "false":
-        conditions.append("(hm_ind IS NULL OR hm_ind != 'Y')")
-
-    # Power Units
-    if filters.get("power_units_min"):
-        conditions.append(f"NULLIF(nbr_power_unit, '')::int >= ${idx}")
-        params.append(int(filters["power_units_min"]))
-        idx += 1
-    if filters.get("power_units_max"):
-        conditions.append(f"NULLIF(nbr_power_unit, '')::int <= ${idx}")
-        params.append(int(filters["power_units_max"]))
-        idx += 1
-
-    # Drivers
-    if filters.get("drivers_min"):
-        conditions.append(f"NULLIF(driver_total, '')::int >= ${idx}")
-        params.append(int(filters["drivers_min"]))
-        idx += 1
-    if filters.get("drivers_max"):
-        conditions.append(f"NULLIF(driver_total, '')::int <= ${idx}")
-        params.append(int(filters["drivers_max"]))
-        idx += 1
-
-    # MCS-150 Form Date range
-    if filters.get("mcs150_date_from"):
-        conditions.append(
-            f"mcs150_date IS NOT NULL AND mcs150_date != '' AND LENGTH(mcs150_date) >= 8 "
-            f"AND mcs150_date >= ${idx}"
-        )
-        params.append(filters["mcs150_date_from"])
-        idx += 1
-    if filters.get("mcs150_date_to"):
-        conditions.append(
-            f"mcs150_date IS NOT NULL AND mcs150_date != '' AND LENGTH(mcs150_date) >= 8 "
-            f"AND mcs150_date <= ${idx}"
-        )
-        params.append(filters["mcs150_date_to"])
-        idx += 1
-
-    # Mileage/VMT range
-    if filters.get("mileage_min"):
-        conditions.append(f"NULLIF(REPLACE(mcs150_mileage, ',', ''), '')::bigint >= ${idx}")
-        params.append(int(filters["mileage_min"]))
-        idx += 1
-    if filters.get("mileage_max"):
-        conditions.append(f"NULLIF(REPLACE(mcs150_mileage, ',', ''), '')::bigint <= ${idx}")
-        params.append(int(filters["mileage_max"]))
-        idx += 1
-
-    # ── Insurance filters (embedded JSONB) ──────────────────────────────────
-
-    # BIPD / Cargo / Bond / Trust Fund on file
-    bipd_on_file = filters.get("bipd_on_file")
-    if bipd_on_file == "1":
-        conditions.append("bipd_file = 'Y'")
-    elif bipd_on_file == "0":
-        conditions.append("(bipd_file IS NULL OR bipd_file != 'Y')")
-
-    cargo_on_file = filters.get("cargo_on_file")
-    if cargo_on_file == "1":
-        conditions.append("cargo_file = 'Y'")
-    elif cargo_on_file == "0":
-        conditions.append("(cargo_file IS NULL OR cargo_file != 'Y')")
-
-    bond_on_file = filters.get("bond_on_file")
-    if bond_on_file == "1":
-        conditions.append("bond_file = 'Y'")
-    elif bond_on_file == "0":
-        conditions.append("(bond_file IS NULL OR bond_file != 'Y')")
-
-    trust_fund_on_file = filters.get("trust_fund_on_file")
-    if trust_fund_on_file == "1":
-        conditions.append(
-            "insurance IS NOT NULL AND insurance::text ILIKE '%TRUST FUND%'"
-        )
-    elif trust_fund_on_file == "0":
-        conditions.append(
-            "(insurance IS NULL OR insurance::text NOT ILIKE '%TRUST FUND%')"
-        )
-
-    # Insurance Required types
-    _INS_TYPE_PATTERN = {"BI&PD": "BIPD%", "CARGO": "CARGO", "BOND": "SURETY", "TRUST FUND": "TRUST FUND"}
-    if filters.get("insurance_required"):
-        ins_types = filters["insurance_required"]
-        if isinstance(ins_types, str):
-            ins_types = ins_types.split(",")
-        or_clauses = []
-        for itype in ins_types:
-            pattern = _INS_TYPE_PATTERN.get(itype, itype)
-            or_clauses.append(
-                f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-                f"WHERE elem->>'ins_type_desc' LIKE ${idx} "
-                f"AND (elem->>'cancl_effective_date' IS NULL OR elem->>'cancl_effective_date' = ''))"
-            )
-            params.append(pattern)
-            idx += 1
-        conditions.append(f"({' OR '.join(or_clauses)})")
-
-    # BIPD coverage amount range
-    if filters.get("bipd_min"):
-        raw_min = int(filters["bipd_min"])
-        compare_min = raw_min // 1000 if raw_min >= 10000 else raw_min
-        conditions.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-            f"WHERE NULLIF(REPLACE(elem->>'max_cov_amount', ',', ''), '')::numeric >= ${idx})"
-        )
-        params.append(compare_min)
-        idx += 1
-    if filters.get("bipd_max"):
-        raw_max = int(filters["bipd_max"])
-        compare_max = raw_max // 1000 if raw_max >= 10000 else raw_max
-        conditions.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-            f"WHERE NULLIF(REPLACE(elem->>'max_cov_amount', ',', ''), '')::numeric <= ${idx})"
-        )
-        params.append(compare_max)
-        idx += 1
-
-    # Insurance effective date range
-    if filters.get("ins_effective_date_from"):
-        parts = filters["ins_effective_date_from"].split("-")
-        date_from_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
-        conditions.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-            f"WHERE elem->>'effective_date' IS NOT NULL AND elem->>'effective_date' LIKE '%/%/%' "
-            f"AND TO_DATE(elem->>'effective_date', 'MM/DD/YYYY') >= TO_DATE(${idx}, 'MM/DD/YYYY'))"
-        )
-        params.append(date_from_db_fmt)
-        idx += 1
-    if filters.get("ins_effective_date_to"):
-        parts = filters["ins_effective_date_to"].split("-")
-        date_to_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
-        conditions.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-            f"WHERE elem->>'effective_date' IS NOT NULL AND elem->>'effective_date' LIKE '%/%/%' "
-            f"AND TO_DATE(elem->>'effective_date', 'MM/DD/YYYY') <= TO_DATE(${idx}, 'MM/DD/YYYY'))"
-        )
-        params.append(date_to_db_fmt)
-        idx += 1
-
-    # Insurance cancellation date range
-    if filters.get("ins_cancellation_date_from"):
-        parts = filters["ins_cancellation_date_from"].split("-")
-        date_from_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
-        conditions.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-            f"WHERE elem->>'cancl_effective_date' IS NOT NULL AND elem->>'cancl_effective_date' != '' "
-            f"AND elem->>'cancl_effective_date' LIKE '%/%/%' "
-            f"AND TO_DATE(elem->>'cancl_effective_date', 'MM/DD/YYYY') >= TO_DATE(${idx}, 'MM/DD/YYYY'))"
-        )
-        params.append(date_from_db_fmt)
-        idx += 1
-    if filters.get("ins_cancellation_date_to"):
-        parts = filters["ins_cancellation_date_to"].split("-")
-        date_to_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
-        conditions.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-            f"WHERE elem->>'cancl_effective_date' IS NOT NULL AND elem->>'cancl_effective_date' != '' "
-            f"AND elem->>'cancl_effective_date' LIKE '%/%/%' "
-            f"AND TO_DATE(elem->>'cancl_effective_date', 'MM/DD/YYYY') <= TO_DATE(${idx}, 'MM/DD/YYYY'))"
-        )
-        params.append(date_to_db_fmt)
-        idx += 1
-
-    # Insurance Company filter
-    _INSURANCE_COMPANY_PATTERNS: dict[str, list[str]] = {
-        "GREAT WEST CASUALTY": ["GREAT WEST%"],
-        "UNITED FINANCIAL CASUALTY": ["UNITED FINANCIAL%"],
-        "GEICO MARINE": ["GEICO MARINE%"],
-        "NORTHLAND INSURANCE": ["NORTHLAND%"],
-        "ARTISAN & TRUCKERS": ["ARTISAN%", "TRUCKERS CASUALTY%"],
-        "CANAL INSURANCE": ["CANAL INS%"],
-        "PROGRESSIVE": ["PROGRESSIVE%"],
-        "BERKSHIRE HATHAWAY": ["BERKSHIRE%"],
-        "OLD REPUBLIC": ["OLD REPUBLIC%"],
-        "SENTRY": ["SENTRY%"],
-        "TRAVELERS": ["TRAVELERS%"],
-    }
-    if filters.get("insurance_company"):
-        companies = filters["insurance_company"]
-        if isinstance(companies, str):
-            companies = companies.split(",")
-        or_clauses = []
-        for company in companies:
-            company_upper = company.strip().upper()
-            patterns = _INSURANCE_COMPANY_PATTERNS.get(company_upper, [f"{company_upper}%"])
-            for pattern in patterns:
-                or_clauses.append(
-                    f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-                    f"WHERE UPPER(elem->>'name_company') LIKE ${idx} "
-                    f"AND (elem->>'cancl_effective_date' IS NULL OR elem->>'cancl_effective_date' = '' "
-                    f"OR TO_DATE(elem->>'cancl_effective_date', 'MM/DD/YYYY') >= CURRENT_DATE))"
-                )
-                params.append(pattern)
-                idx += 1
-        conditions.append(f"({' OR '.join(or_clauses)})")
-
-    # Renewal Policy Monthly filter
-    if filters.get("renewal_policy_months"):
-        months = int(filters["renewal_policy_months"])
-        conditions.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-            f"WHERE elem->>'effective_date' IS NOT NULL AND elem->>'effective_date' LIKE '%/%/%' "
-            f"AND (elem->>'cancl_effective_date' IS NULL OR elem->>'cancl_effective_date' = '' "
-            f"OR TO_DATE(elem->>'cancl_effective_date', 'MM/DD/YYYY') >= CURRENT_DATE) "
-            f"AND ("
-            f"  CASE "
-            f"    WHEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
-            f"         >= CURRENT_DATE "
-            f"    THEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
-            f"    ELSE MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"         EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"             EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
-            f"  END"
-            f") BETWEEN CURRENT_DATE AND (DATE_TRUNC('MONTH', CURRENT_DATE + MAKE_INTERVAL(months => ${idx})) + INTERVAL '1 MONTH - 1 DAY')::date"
-            f")"
-        )
-        params.append(months)
-        idx += 1
-
-    # Renewal Policy Date range filter
-    if filters.get("renewal_date_from"):
-        parts = filters["renewal_date_from"].split("-")
-        date_from_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
-        conditions.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-            f"WHERE elem->>'effective_date' IS NOT NULL AND elem->>'effective_date' LIKE '%/%/%' "
-            f"AND (elem->>'cancl_effective_date' IS NULL OR elem->>'cancl_effective_date' = '' "
-            f"OR TO_DATE(elem->>'cancl_effective_date', 'MM/DD/YYYY') >= CURRENT_DATE) "
-            f"AND ("
-            f"  CASE "
-            f"    WHEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
-            f"         >= CURRENT_DATE "
-            f"    THEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
-            f"    ELSE MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"         EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"             EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
-            f"  END"
-            f") >= TO_DATE(${idx}, 'MM/DD/YYYY')"
-            f")"
-        )
-        params.append(date_from_db_fmt)
-        idx += 1
-    if filters.get("renewal_date_to"):
-        parts = filters["renewal_date_to"].split("-")
-        date_to_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
-        conditions.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance, '[]'::jsonb)) elem "
-            f"WHERE elem->>'effective_date' IS NOT NULL AND elem->>'effective_date' LIKE '%/%/%' "
-            f"AND (elem->>'cancl_effective_date' IS NULL OR elem->>'cancl_effective_date' = '' "
-            f"OR TO_DATE(elem->>'cancl_effective_date', 'MM/DD/YYYY') >= CURRENT_DATE) "
-            f"AND ("
-            f"  CASE "
-            f"    WHEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
-            f"         >= CURRENT_DATE "
-            f"    THEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
-            f"    ELSE MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"         EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, "
-            f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"             EXTRACT(MONTH FROM TO_DATE(elem->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
-            f"  END"
-            f") <= TO_DATE(${idx}, 'MM/DD/YYYY')"
-            f")"
-        )
-        params.append(date_to_db_fmt)
-        idx += 1
-
-    where = " AND ".join(conditions) if conditions else "TRUE"
-
-    is_filtered = len(conditions) > 0
-    if is_filtered:
-        limit_val = int(filters.get("limit", 500))
-    else:
-        limit_val = int(filters.get("limit", 200))
-
-    offset_val = int(filters.get("offset", 0))
-
-    # No JOINs needed — insurance is embedded in carriers table
-    query = f"""
-        SELECT {_CARRIER_SELECT_COLS}
-        FROM carriers
-        WHERE {where}
-        ORDER BY dot_number ASC
-        LIMIT {limit_val} OFFSET {offset_val}
-    """
-
-    count_query = f"""
-        SELECT COUNT(*) as cnt FROM carriers
-        WHERE {where}
-    """
-
-    try:
-        rows, count_row = await asyncio.gather(
-            pool.fetch(query, *params),
-            pool.fetchrow(count_query, *params),
-        )
-        filtered_count = count_row["cnt"] if count_row else 0
-        return {
-            "data": [_carrier_row_to_dict(row) for row in rows],
-            "filtered_count": filtered_count,
-        }
-    except Exception as e:
-        print(f"[DB] Error fetching carriers: {e}")
-        return {"data": [], "filtered_count": 0}
-
-
-async def delete_carrier(dot_number: str) -> bool:
-    pool = get_pool()
-    try:
-        result = await pool.execute(
-            "DELETE FROM carriers WHERE dot_number = $1", dot_number
-        )
-        return not result.endswith("0")
-    except Exception as e:
-        print(f"[DB] Error deleting carrier DOT {dot_number}: {e}")
-        return False
-
-
-async def get_carrier_count() -> int:
-    pool = get_pool()
-    try:
-        row = await pool.fetchrow("SELECT COUNT(*) as cnt FROM carriers")
-        return row["cnt"] if row else 0
-    except Exception as e:
-        print(f"[DB] Error getting carrier count: {e}")
-        return 0
-
-
-async def get_carrier_dashboard_stats() -> dict:
-    pool = get_pool()
-    try:
-        row = await pool.fetchrow("""
-            SELECT
-                COUNT(*) AS total,
-                COUNT(*) FILTER (WHERE status_code = 'A') AS active_carriers,
-                COUNT(*) FILTER (WHERE email_address IS NOT NULL AND email_address != '') AS with_email,
-                COUNT(*) FILTER (WHERE safety_rating IS NOT NULL AND safety_rating != '') AS with_safety_rating,
-                COUNT(*) FILTER (WHERE insurance IS NOT NULL AND insurance != '[]'::jsonb AND insurance != 'null'::jsonb) AS with_insurance,
-                COUNT(*) FILTER (WHERE hm_ind = 'Y') AS with_hazmat,
-                COUNT(*) FILTER (WHERE status_code != 'A' OR status_code IS NULL) AS not_authorized
-            FROM carriers
-        """)
-        if not row:
-            return {
-                "total": 0, "active_carriers": 0,
-                "with_email": 0, "email_rate": "0",
-                "with_safety_rating": 0, "with_insurance": 0,
-                "with_hazmat": 0,
-                "not_authorized": 0, "other": 0,
-            }
-        total = row["total"]
-        active = row["active_carriers"]
-        not_auth = row["not_authorized"]
-        with_email = row["with_email"]
-        email_rate = f"{(with_email / total * 100):.1f}" if total > 0 else "0"
-        return {
-            "total": total,
-            "active_carriers": active,
-            "with_email": with_email,
-            "email_rate": email_rate,
-            "with_safety_rating": row["with_safety_rating"],
-            "with_insurance": row["with_insurance"],
-            "with_hazmat": row["with_hazmat"],
-            "not_authorized": not_auth,
-            "other": total - active - not_auth,
-        }
-    except Exception as e:
-        print(f"[DB] Error getting dashboard stats: {e}")
-        return {
-            "total": 0, "active_carriers": 0,
-            "with_email": 0, "email_rate": "0",
-            "with_safety_rating": 0, "with_insurance": 0,
-            "with_hazmat": 0,
-            "not_authorized": 0, "other": 0,
-        }
-
-
-async def get_carriers_by_mc_range(start: str, end: str) -> list[dict]:
-    pool = get_pool()
-    try:
-        rows = await pool.fetch(
-            f"""
-            SELECT {_CARRIER_SELECT_COLS}
-            FROM carriers
-            WHERE temp >= $1::bigint AND temp <= $2::bigint
-            ORDER BY temp ASC
-            """,
-            int(start),
-            int(end),
-        )
-        return [_carrier_row_to_dict(row) for row in rows]
-    except Exception as e:
-        print(f"[DB] Error fetching MC range: {e}")
-        return []
-
-
-async def fetch_insurance_history(identifier: str) -> list[dict]:
-    """Fetch insurance from embedded JSONB in carriers table.
-    Accepts MC number or DOT number as identifier.
-    """
-    pool = get_pool()
-    try:
-        # Try to find by DOT number first, then by MC (temp or dockets)
-        row = None
-        if identifier.isdigit():
-            row = await pool.fetchrow(
-                "SELECT insurance FROM carriers WHERE dot_number = $1 LIMIT 1",
-                identifier,
-            )
-            if not row:
-                row = await pool.fetchrow(
-                    "SELECT insurance FROM carriers WHERE temp = $1 LIMIT 1",
-                    int(identifier),
-                )
-        else:
-            row = await pool.fetchrow(
-                "SELECT insurance FROM carriers WHERE dockets::text ILIKE $1 LIMIT 1",
-                f"%{identifier}%",
-            )
-
-        if not row:
-            return []
-        return _format_embedded_insurance(row["insurance"])
-    except Exception as e:
-        print(f"[DB] Error fetching insurance history for {identifier}: {e}")
-        return []
-
-
-# ── User functions ───────────────────────────────────────────────────────────
+# ── Users ─────────────────────────────────────────────────────────────────────
 
 def _user_row_to_dict(row) -> dict:
     d = dict(row)
@@ -1328,9 +1409,7 @@ async def fetch_user_by_email(email: str) -> Optional[dict]:
             "is_blocked, created_at, updated_at FROM users WHERE email = $1",
             email.lower(),
         )
-        if row:
-            return _user_row_to_dict(row)
-        return None
+        return _user_row_to_dict(row) if row else None
     except Exception as e:
         print(f"[DB] Error fetching user by email: {e}")
         return None
@@ -1360,9 +1439,7 @@ async def create_user(user_data: dict) -> Optional[dict]:
             user_data.get("is_online", False),
             user_data.get("is_blocked", False),
         )
-        if row:
-            return _user_row_to_dict(row)
-        return None
+        return _user_row_to_dict(row) if row else None
     except Exception as e:
         print(f"[DB] Error creating user: {e}")
         return None
@@ -1370,18 +1447,18 @@ async def create_user(user_data: dict) -> Optional[dict]:
 
 async def update_user(user_id: str, user_data: dict) -> bool:
     pool = get_pool()
-    _ALLOWED_COLUMNS = {
+    _ALLOWED = {
         "name", "role", "plan", "daily_limit",
         "records_extracted_today", "last_active",
         "ip_address", "is_online", "is_blocked",
     }
-    columns = {k: v for k, v in user_data.items() if k in _ALLOWED_COLUMNS}
+    columns = {k: v for k, v in user_data.items() if k in _ALLOWED}
     if not columns:
         return False
     set_clauses = []
     values = []
-    for idx, (col, val) in enumerate(columns.items(), start=1):
-        set_clauses.append(f"{col} = ${idx}")
+    for i, (col, val) in enumerate(columns.items(), start=1):
+        set_clauses.append(f"{col} = ${i}")
         values.append(val)
     values.append(user_id)
     query = f"UPDATE users SET {', '.join(set_clauses)} WHERE user_id = ${len(values)}"
@@ -1396,9 +1473,7 @@ async def update_user(user_id: str, user_data: dict) -> bool:
 async def delete_user(user_id: str) -> bool:
     pool = get_pool()
     try:
-        result = await pool.execute(
-            "DELETE FROM users WHERE user_id = $1", user_id
-        )
+        result = await pool.execute("DELETE FROM users WHERE user_id = $1", user_id)
         return not result.endswith("0")
     except Exception as e:
         print(f"[DB] Error deleting user {user_id}: {e}")
@@ -1411,22 +1486,16 @@ async def get_user_password_hash(email: str) -> Optional[str]:
         row = await pool.fetchrow(
             "SELECT password_hash FROM users WHERE email = $1", email.lower()
         )
-        if row and row["password_hash"]:
-            return row["password_hash"]
-        return None
+        return row["password_hash"] if row and row["password_hash"] else None
     except Exception as e:
         print(f"[DB] Error fetching password hash: {e}")
         return None
 
 
-# ── Blocked IP functions ─────────────────────────────────────────────────────
-
 async def fetch_blocked_ips() -> list[dict]:
     pool = get_pool()
     try:
-        rows = await pool.fetch(
-            "SELECT * FROM blocked_ips ORDER BY blocked_at DESC"
-        )
+        rows = await pool.fetch("SELECT * FROM blocked_ips ORDER BY blocked_at DESC")
         return [_user_row_to_dict(row) for row in rows]
     except Exception as e:
         print(f"[DB] Error fetching blocked IPs: {e}")
@@ -1437,11 +1506,7 @@ async def block_ip(ip_address: str, reason: str) -> bool:
     pool = get_pool()
     try:
         await pool.execute(
-            """
-            INSERT INTO blocked_ips (ip_address, reason)
-            VALUES ($1, $2)
-            ON CONFLICT (ip_address) DO NOTHING
-            """,
+            "INSERT INTO blocked_ips (ip_address, reason) VALUES ($1, $2) ON CONFLICT (ip_address) DO NOTHING",
             ip_address,
             reason or "No reason provided",
         )
@@ -1454,9 +1519,7 @@ async def block_ip(ip_address: str, reason: str) -> bool:
 async def unblock_ip(ip_address: str) -> bool:
     pool = get_pool()
     try:
-        result = await pool.execute(
-            "DELETE FROM blocked_ips WHERE ip_address = $1", ip_address
-        )
+        result = await pool.execute("DELETE FROM blocked_ips WHERE ip_address = $1", ip_address)
         return not result.endswith("0")
     except Exception as e:
         print(f"[DB] Error unblocking IP {ip_address}: {e}")
@@ -1467,16 +1530,15 @@ async def is_ip_blocked(ip_address: str) -> bool:
     pool = get_pool()
     try:
         row = await pool.fetchrow(
-            "SELECT ip_address FROM blocked_ips WHERE ip_address = $1",
-            ip_address,
+            "SELECT ip_address FROM blocked_ips WHERE ip_address = $1", ip_address
         )
         return row is not None
     except Exception as e:
-        print(f"[DB] Error checking IP block status: {e}")
+        print(f"[DB] Error checking IP block: {e}")
         return False
 
 
-# ── New Ventures functions ───────────────────────────────────────────────────
+# ── New Ventures ─────────────────────────────────────────────────────────────
 
 _NV_COLUMNS = [
     "dot_number", "prefix", "docket_number", "status_code", "carship",
@@ -1538,18 +1600,11 @@ async def save_new_venture_entries(entries: list[dict], scrape_date: str) -> dic
         return {"success": True, "saved": 0, "skipped": 0}
 
     cols = _NV_COLUMNS + ["raw_data", "scrape_date"]
-    col_list = ", ".join(cols)
     placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
-
-    update_cols = [c for c in cols if c not in ("dot_number", "add_date")]
-    on_conflict_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
-    on_conflict_set += ", updated_at = NOW()"
-
-    insert_sql = f"""
-        INSERT INTO new_ventures ({col_list})
-        VALUES ({placeholders})
-        ON CONFLICT (dot_number, add_date) DO UPDATE SET {on_conflict_set}
-    """
+    col_names = ", ".join(cols)
+    update_set = ", ".join(
+        f"{c} = EXCLUDED.{c}" for c in _NV_COLUMNS + ["raw_data"]
+    )
 
     saved = 0
     skipped = 0
@@ -1562,17 +1617,23 @@ async def save_new_venture_entries(entries: list[dict], scrape_date: str) -> dic
                     batch = entries[i:i + batch_size]
                     args = []
                     for entry in batch:
-                        row_args = []
-                        for col in _NV_COLUMNS:
-                            val = entry.get(col)
-                            row_args.append(val.strip() if isinstance(val, str) else val)
-                        row_args.append(_to_jsonb(entry.get("raw_data")))
-                        row_args.append(scrape_date)
-                        args.append(tuple(row_args))
-                    await conn.executemany(insert_sql, args)
+                        row_vals = [entry.get(c) for c in _NV_COLUMNS]
+                        row_vals.append(_to_jsonb(entry.get("raw_data")))
+                        row_vals.append(scrape_date)
+                        args.append(tuple(row_vals))
+                    await conn.executemany(
+                        f"""
+                        INSERT INTO new_ventures ({col_names})
+                        VALUES ({placeholders})
+                        ON CONFLICT (dot_number, add_date) DO UPDATE SET
+                            {update_set},
+                            updated_at = NOW()
+                        """,
+                        args,
+                    )
                     saved += len(batch)
     except Exception as e:
-        print(f"[DB] Error batch-saving new venture entries: {e}")
+        print(f"[DB] Error saving new ventures: {e}")
         skipped = len(entries) - saved
 
     return {"success": True, "saved": saved, "skipped": skipped}
@@ -1580,172 +1641,50 @@ async def save_new_venture_entries(entries: list[dict], scrape_date: str) -> dic
 
 async def fetch_new_ventures(filters: dict) -> list[dict]:
     pool = get_pool()
-
     conditions: list[str] = []
     params: list = []
     idx = 1
 
-    if filters.get("docket_number"):
-        conditions.append(f"docket_number ILIKE ${idx}")
-        params.append(f"%{filters['docket_number']}%")
+    if filters.get("scrape_date"):
+        conditions.append(f"scrape_date = ${idx}")
+        params.append(filters["scrape_date"])
         idx += 1
-
-    if filters.get("dot_number"):
-        conditions.append(f"dot_number ILIKE ${idx}")
-        params.append(f"%{filters['dot_number']}%")
+    if filters.get("search_term"):
+        conditions.append(f"(name ILIKE ${idx} OR docket_number ILIKE ${idx} OR dot_number ILIKE ${idx})")
+        params.append(f"%{filters['search_term']}%")
         idx += 1
-
-    if filters.get("company_name"):
-        conditions.append(f"(name ILIKE ${idx} OR name_dba ILIKE ${idx})")
-        params.append(f"%{filters['company_name']}%")
+    if filters.get("status_code"):
+        conditions.append(f"status_code = ${idx}")
+        params.append(filters["status_code"])
         idx += 1
-
-    if filters.get("date_from"):
-        conditions.append(f"add_date >= ${idx}")
-        params.append(filters["date_from"])
-        idx += 1
-    if filters.get("date_to"):
-        conditions.append(f"add_date <= ${idx}")
-        params.append(filters["date_to"])
-        idx += 1
-
-    active = filters.get("active")
-    if active == "active":
-        conditions.append(f"((operating_status ILIKE ${idx} AND operating_status NOT ILIKE ${idx + 1}) OR operating_status ILIKE ${idx + 2})")
-        params.append("%AUTHORIZED%")
-        params.append("%NOT AUTHORIZED%")
-        params.append("ACTIVE")
-        idx += 3
-    elif active == "inactive":
-        conditions.append(f"(operating_status ILIKE ${idx} OR operating_status IS NULL OR operating_status = '')")
-        params.append("%NOT AUTHORIZED%")
-        idx += 1
-    elif active == "authorization_pending":
-        conditions.append(f"operating_status ILIKE ${idx}")
-        params.append("%PENDING%")
-        idx += 1
-    elif active == "not_authorized":
-        conditions.append(f"operating_status ILIKE ${idx}")
-        params.append("%NOT AUTHORIZED%")
-        idx += 1
-    elif active == "true":
-        conditions.append(f"((operating_status ILIKE ${idx} AND operating_status NOT ILIKE ${idx + 1}) OR operating_status ILIKE ${idx + 2})")
-        params.append("%AUTHORIZED%")
-        params.append("%NOT AUTHORIZED%")
-        params.append("ACTIVE")
-        idx += 3
-    elif active == "false":
-        conditions.append(f"operating_status NOT ILIKE ${idx}")
-        params.append("%AUTHORIZED%")
-        idx += 1
-
     if filters.get("state"):
-        states = [s.strip().upper() for s in filters["state"].split("|") if s.strip()]
-        if len(states) == 1:
-            conditions.append(f"phy_st = ${idx}")
-            params.append(states[0])
-            idx += 1
-        elif states:
-            placeholders = ", ".join(f"${idx + i}" for i in range(len(states)))
-            conditions.append(f"phy_st IN ({placeholders})")
-            for s in states:
-                params.append(s)
-                idx += 1
-
-    has_email = filters.get("has_email")
-    if has_email == "true":
+        conditions.append(f"phy_st = ${idx}")
+        params.append(filters["state"])
+        idx += 1
+    if filters.get("has_email") == "true":
         conditions.append("email_address IS NOT NULL AND email_address != ''")
-    elif has_email == "false":
-        conditions.append("(email_address IS NULL OR email_address = '')")
-
+    if filters.get("hm_ind"):
+        conditions.append(f"hm_ind = ${idx}")
+        params.append(filters["hm_ind"])
+        idx += 1
     if filters.get("carrier_operation"):
         conditions.append(f"carrier_operation ILIKE ${idx}")
         params.append(f"%{filters['carrier_operation']}%")
         idx += 1
 
-    if filters.get("hazmat"):
-        if filters["hazmat"] == "true":
-            conditions.append("hm_ind = 'Y'")
-        elif filters["hazmat"] == "false":
-            conditions.append("(hm_ind IS NULL OR hm_ind != 'Y')")
-
-    if filters.get("power_units_min"):
-        conditions.append(f"NULLIF(total_pwr, '')::int >= ${idx}")
-        params.append(int(filters["power_units_min"]))
-        idx += 1
-    if filters.get("power_units_max"):
-        conditions.append(f"NULLIF(total_pwr, '')::int <= ${idx}")
-        params.append(int(filters["power_units_max"]))
-        idx += 1
-
-    if filters.get("drivers_min"):
-        conditions.append(f"NULLIF(total_drivers, '')::int >= ${idx}")
-        params.append(int(filters["drivers_min"]))
-        idx += 1
-    if filters.get("drivers_max"):
-        conditions.append(f"NULLIF(total_drivers, '')::int <= ${idx}")
-        params.append(int(filters["drivers_max"]))
-        idx += 1
-
-    if filters.get("bipd_on_file"):
-        if filters["bipd_on_file"] == "true":
-            conditions.append("bipd_file = 'Y'")
-        elif filters["bipd_on_file"] == "false":
-            conditions.append("(bipd_file IS NULL OR bipd_file != 'Y')")
-    if filters.get("cargo_on_file"):
-        if filters["cargo_on_file"] == "true":
-            conditions.append("cargo_file = 'Y'")
-        elif filters["cargo_on_file"] == "false":
-            conditions.append("(cargo_file IS NULL OR cargo_file != 'Y')")
-    if filters.get("bond_on_file"):
-        if filters["bond_on_file"] == "true":
-            conditions.append("bond_file = 'Y'")
-        elif filters["bond_on_file"] == "false":
-            conditions.append("(bond_file IS NULL OR bond_file != 'Y')")
-
     where = " AND ".join(conditions) if conditions else "TRUE"
-
-    is_filtered = len(conditions) > 0
-    if is_filtered:
-        limit_val = int(filters.get("limit", 10000))
-    else:
-        limit_val = int(filters.get("limit", 200))
-
+    limit_val = int(filters.get("limit", 500))
     offset_val = int(filters.get("offset", 0))
 
-    query = f"""
-        SELECT * FROM new_ventures
-        WHERE {where}
-        ORDER BY created_at DESC
-        LIMIT {limit_val} OFFSET {offset_val}
-    """
-
-    count_query = f"""
-        SELECT COUNT(*) as cnt FROM new_ventures
-        WHERE {where}
-    """
-
-    dates_query = "SELECT DISTINCT add_date FROM new_ventures WHERE add_date IS NOT NULL ORDER BY add_date DESC"
-
-    total_query = "SELECT COUNT(*) as cnt FROM new_ventures"
-
     try:
-        rows = await pool.fetch(query, *params)
-        count_row = await pool.fetchrow(count_query, *params)
-        filtered_count = count_row["cnt"] if count_row else 0
-        date_rows = await pool.fetch(dates_query)
-        available_dates = [r["add_date"] for r in date_rows]
-        total_row = await pool.fetchrow(total_query)
-        total_count = total_row["cnt"] if total_row else 0
-        return {
-            "data": [_new_venture_row_to_dict(row) for row in rows],
-            "filtered_count": filtered_count,
-            "total_count": total_count,
-            "available_dates": available_dates,
-        }
+        rows = await pool.fetch(
+            f"SELECT * FROM new_ventures WHERE {where} ORDER BY created_at DESC LIMIT {limit_val} OFFSET {offset_val}",
+            *params,
+        )
+        return [_new_venture_row_to_dict(row) for row in rows]
     except Exception as e:
         print(f"[DB] Error fetching new ventures: {e}")
-        return {"data": [], "filtered_count": 0, "total_count": 0, "available_dates": []}
+        return []
 
 
 async def get_new_venture_count() -> int:
@@ -1762,11 +1701,11 @@ async def get_new_venture_scraped_dates() -> list[str]:
     pool = get_pool()
     try:
         rows = await pool.fetch(
-            "SELECT DISTINCT add_date FROM new_ventures WHERE add_date IS NOT NULL ORDER BY add_date DESC"
+            "SELECT DISTINCT scrape_date FROM new_ventures ORDER BY scrape_date DESC"
         )
-        return [row["add_date"] for row in rows]
+        return [row["scrape_date"] for row in rows]
     except Exception as e:
-        print(f"[DB] Error fetching new venture dates: {e}")
+        print(f"[DB] Error getting scrape dates: {e}")
         return []
 
 
@@ -1774,20 +1713,16 @@ async def fetch_new_venture_by_id(record_id: str) -> dict | None:
     pool = get_pool()
     try:
         row = await pool.fetchrow("SELECT * FROM new_ventures WHERE id = $1", record_id)
-        if row:
-            return _new_venture_row_to_dict(row)
-        return None
+        return _new_venture_row_to_dict(row) if row else None
     except Exception as e:
-        print(f"[DB] Error fetching new venture {record_id}: {e}")
+        print(f"[DB] Error fetching new venture by ID: {e}")
         return None
 
 
 async def delete_new_venture(record_id: str) -> bool:
     pool = get_pool()
     try:
-        result = await pool.execute(
-            "DELETE FROM new_ventures WHERE id = $1", record_id
-        )
+        result = await pool.execute("DELETE FROM new_ventures WHERE id = $1", record_id)
         return not result.endswith("0")
     except Exception as e:
         print(f"[DB] Error deleting new venture {record_id}: {e}")
