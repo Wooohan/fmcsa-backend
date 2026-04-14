@@ -1094,7 +1094,7 @@ async def fetch_carriers(filters: dict) -> dict:
         SELECT {_LIST_COLS}
         FROM carriers c
         WHERE {where}
-        ORDER BY c.created_at DESC
+        ORDER BY c.mc_number ASC
         LIMIT {limit_val} OFFSET {offset_val}
     """
 
