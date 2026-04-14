@@ -124,36 +124,23 @@ class IPBlockMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-# ── CORS must be added FIRST so it runs OUTERMOST (before auth/ip checks) ──
-_cors_raw = os.getenv("CORS_ORIGINS", "")
-_cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()] if _cors_raw else []
-
-# Always include the primary frontend domains as guaranteed fallback
-_ALWAYS_ALLOWED = [
-    "https://fmcsa-front.vercel.app",
-    "https://hussfix591.vercel.app",
-    "https://fmcsa-front-end.vercel.app",
-    "https://frontendl01.vercel.app",
-]
-for _d in _ALWAYS_ALLOWED:
-    if _d not in _cors_origins:
-        _cors_origins.append(_d)
-
-print(f"[CORS] Allowing origins: {_cors_origins}")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-
-# Auth/IP/GZip added after CORS (so they run inside CORS in the stack)
 app.add_middleware(AuthMiddleware)
 app.add_middleware(IPBlockMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=500)
+_cors_raw = os.getenv("CORS_ORIGINS", "")
+if not _cors_raw:
+    import warnings
+    warnings.warn("CORS_ORIGINS is not set. Defaulting to restrictive CORS policy.")
+    _cors_origins = []
+else:
+    _cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins if _cors_origins else ["*"],
+    allow_credentials=bool(_cors_origins),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 ALLOWED_DOMAINS = {
     "safer.fmcsa.dot.gov",
     "ai.fmcsa.dot.gov",
