@@ -110,9 +110,8 @@ CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 
 CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip ON blocked_ips(ip_address);
 
-CREATE INDEX IF NOT EXISTS idx_insurance_history_docket ON insurance_history(docket_number);
-CREATE INDEX IF NOT EXISTS idx_insurance_history_docket_type ON insurance_history(docket_number, ins_type_desc);
-CREATE INDEX IF NOT EXISTS idx_insurance_history_docket_cancl ON insurance_history(docket_number, cancl_effective_date);
+-- insurance data is embedded in carriers.insurance_policies JSONB (no separate table)
+CREATE INDEX IF NOT EXISTS idx_carriers_insurance_policies ON carriers USING gin (insurance_policies);
 
 -- ── Timestamp triggers ──────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION update_carriers_updated_at()
@@ -601,9 +600,9 @@ def _carrier_row_to_dict(row) -> dict:
     for key in ("basic_scores", "oos_rates", "insurance_policies", "inspections", "crashes"):
         if key in d:
             d[key] = _parse_jsonb(d[key])
-    if "insurance_history_filings" in d:
-        raw = _parse_jsonb(d["insurance_history_filings"])
-        d["insurance_history_filings"] = _format_insurance_history(raw)
+    # Format embedded insurance_policies as insurance_history_filings for frontend
+    if "insurance_policies" in d and d["insurance_policies"]:
+        d["insurance_history_filings"] = _format_insurance_history(d["insurance_policies"])
     for key in ("created_at", "updated_at"):
         if key in d and d[key] is not None:
             d[key] = d[key].isoformat()
@@ -747,7 +746,7 @@ async def fetch_carriers(filters: dict) -> dict:
         for itype in ins_types:
             pattern = _INS_TYPE_PATTERN.get(itype, itype)
             or_clauses.append(
-                f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number AND ih.ins_type_desc LIKE ${idx} AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = ''))"
+                f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih WHERE ih->>'ins_type_desc' LIKE ${idx} AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = ''))"
             )
             params.append(pattern)
             idx += 1
@@ -756,52 +755,52 @@ async def fetch_carriers(filters: dict) -> dict:
     bipd_on_file = filters.get("bipd_on_file")
     if bipd_on_file == "1":
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number AND ih.ins_type_desc LIKE ${idx} AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = ''))"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih WHERE ih->>'ins_type_desc' LIKE ${idx} AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = ''))"
         )
         params.append("BIPD%")
         idx += 1
     elif bipd_on_file == "0":
         conditions.append(
-            f"NOT EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number AND ih.ins_type_desc LIKE ${idx} AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = ''))"
+            f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih WHERE ih->>'ins_type_desc' LIKE ${idx} AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = ''))"
         )
         params.append("BIPD%")
         idx += 1
     cargo_on_file = filters.get("cargo_on_file")
     if cargo_on_file == "1":
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number AND ih.ins_type_desc = ${idx} AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = ''))"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih WHERE ih->>'ins_type_desc' = ${idx} AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = ''))"
         )
         params.append("CARGO")
         idx += 1
     elif cargo_on_file == "0":
         conditions.append(
-            f"NOT EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number AND ih.ins_type_desc = ${idx} AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = ''))"
+            f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih WHERE ih->>'ins_type_desc' = ${idx} AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = ''))"
         )
         params.append("CARGO")
         idx += 1
     bond_on_file = filters.get("bond_on_file")
     if bond_on_file == "1":
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number AND ih.ins_type_desc = ${idx} AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = ''))"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih WHERE ih->>'ins_type_desc' = ${idx} AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = ''))"
         )
         params.append("SURETY")
         idx += 1
     elif bond_on_file == "0":
         conditions.append(
-            f"NOT EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number AND ih.ins_type_desc = ${idx} AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = ''))"
+            f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih WHERE ih->>'ins_type_desc' = ${idx} AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = ''))"
         )
         params.append("SURETY")
         idx += 1
     trust_fund_on_file = filters.get("trust_fund_on_file")
     if trust_fund_on_file == "1":
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number AND ih.ins_type_desc = ${idx} AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = ''))"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih WHERE ih->>'ins_type_desc' = ${idx} AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = ''))"
         )
         params.append("TRUST FUND")
         idx += 1
     elif trust_fund_on_file == "0":
         conditions.append(
-            f"NOT EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number AND ih.ins_type_desc = ${idx} AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = ''))"
+            f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih WHERE ih->>'ins_type_desc' = ${idx} AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = ''))"
         )
         params.append("TRUST FUND")
         idx += 1
@@ -812,8 +811,8 @@ async def fetch_carriers(filters: dict) -> dict:
         # If the user typed a value >= 10000, assume they meant full dollars and convert to thousands
         compare_min = raw_min // 1000 if raw_min >= 10000 else raw_min
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
-            f"AND NULLIF(REPLACE(ih.max_cov_amount, ',', ''), '')::numeric >= ${idx})"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih "
+            f"WHERE NULLIF(REPLACE(ih->>'max_cov_amount', ',', ''), '')::numeric >= ${idx})"
         )
         params.append(compare_min)
         idx += 1
@@ -823,8 +822,8 @@ async def fetch_carriers(filters: dict) -> dict:
         # If the user typed a value >= 10000, assume they meant full dollars and convert to thousands
         compare_max = raw_max // 1000 if raw_max >= 10000 else raw_max
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
-            f"AND NULLIF(REPLACE(ih.max_cov_amount, ',', ''), '')::numeric <= ${idx})"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih "
+            f"WHERE NULLIF(REPLACE(ih->>'max_cov_amount', ',', ''), '')::numeric <= ${idx})"
         )
         params.append(compare_max)
         idx += 1
@@ -836,9 +835,9 @@ async def fetch_carriers(filters: dict) -> dict:
         parts = filters["ins_effective_date_from"].split("-")
         date_from_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
-            f"AND ih.effective_date IS NOT NULL AND ih.effective_date LIKE '%/%/%' "
-            f"AND TO_DATE(ih.effective_date, 'MM/DD/YYYY') >= TO_DATE(${idx}, 'MM/DD/YYYY'))"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih "
+            f"WHERE ih->>'effective_date' IS NOT NULL AND ih->>'effective_date' LIKE '%/%/%' "
+            f"AND TO_DATE(ih->>'effective_date', 'MM/DD/YYYY') >= TO_DATE(${idx}, 'MM/DD/YYYY'))"
         )
         params.append(date_from_db_fmt)
         idx += 1
@@ -846,9 +845,9 @@ async def fetch_carriers(filters: dict) -> dict:
         parts = filters["ins_effective_date_to"].split("-")
         date_to_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
-            f"AND ih.effective_date IS NOT NULL AND ih.effective_date LIKE '%/%/%' "
-            f"AND TO_DATE(ih.effective_date, 'MM/DD/YYYY') <= TO_DATE(${idx}, 'MM/DD/YYYY'))"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih "
+            f"WHERE ih->>'effective_date' IS NOT NULL AND ih->>'effective_date' LIKE '%/%/%' "
+            f"AND TO_DATE(ih->>'effective_date', 'MM/DD/YYYY') <= TO_DATE(${idx}, 'MM/DD/YYYY'))"
         )
         params.append(date_to_db_fmt)
         idx += 1
@@ -859,9 +858,9 @@ async def fetch_carriers(filters: dict) -> dict:
         parts = filters["ins_cancellation_date_from"].split("-")
         date_from_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
-            f"AND ih.cancl_effective_date IS NOT NULL AND ih.cancl_effective_date != '' AND ih.cancl_effective_date LIKE '%/%/%' "
-            f"AND TO_DATE(ih.cancl_effective_date, 'MM/DD/YYYY') >= TO_DATE(${idx}, 'MM/DD/YYYY'))"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih "
+            f"WHERE ih->>'cancl_effective_date' IS NOT NULL AND ih->>'cancl_effective_date' != '' AND ih->>'cancl_effective_date' LIKE '%/%/%' "
+            f"AND TO_DATE(ih->>'cancl_effective_date', 'MM/DD/YYYY') >= TO_DATE(${idx}, 'MM/DD/YYYY'))"
         )
         params.append(date_from_db_fmt)
         idx += 1
@@ -869,9 +868,9 @@ async def fetch_carriers(filters: dict) -> dict:
         parts = filters["ins_cancellation_date_to"].split("-")
         date_to_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
-            f"AND ih.cancl_effective_date IS NOT NULL AND ih.cancl_effective_date != '' AND ih.cancl_effective_date LIKE '%/%/%' "
-            f"AND TO_DATE(ih.cancl_effective_date, 'MM/DD/YYYY') <= TO_DATE(${idx}, 'MM/DD/YYYY'))"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih "
+            f"WHERE ih->>'cancl_effective_date' IS NOT NULL AND ih->>'cancl_effective_date' != '' AND ih->>'cancl_effective_date' LIKE '%/%/%' "
+            f"AND TO_DATE(ih->>'cancl_effective_date', 'MM/DD/YYYY') <= TO_DATE(${idx}, 'MM/DD/YYYY'))"
         )
         params.append(date_to_db_fmt)
         idx += 1
@@ -967,10 +966,10 @@ async def fetch_carriers(filters: dict) -> dict:
             patterns = _INSURANCE_COMPANY_PATTERNS.get(company_upper, [f"{company_upper}%"])
             for pattern in patterns:
                 or_clauses.append(
-                    f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
-                    f"AND UPPER(ih.name_company) LIKE ${idx} "
-                    f"AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = '' "
-                    f"OR TO_DATE(ih.cancl_effective_date, 'MM/DD/YYYY') >= CURRENT_DATE))"
+                    f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih "
+                    f"WHERE UPPER(ih->>'name_company') LIKE ${idx} "
+                    f"AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = '' "
+                    f"OR TO_DATE(ih->>'cancl_effective_date', 'MM/DD/YYYY') >= CURRENT_DATE))"
                 )
                 params.append(pattern)
                 idx += 1
@@ -983,28 +982,28 @@ async def fetch_carriers(filters: dict) -> dict:
     if filters.get("renewal_policy_months"):
         months = int(filters["renewal_policy_months"])
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
-            f"AND ih.effective_date IS NOT NULL AND ih.effective_date LIKE '%/%/%' "
-            f"AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = '' "
-            f"OR TO_DATE(ih.cancl_effective_date, 'MM/DD/YYYY') >= CURRENT_DATE) "
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih "
+            f"WHERE ih->>'effective_date' IS NOT NULL AND ih->>'effective_date' LIKE '%/%/%' "
+            f"AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = '' "
+            f"OR TO_DATE(ih->>'cancl_effective_date', 'MM/DD/YYYY') >= CURRENT_DATE) "
             f"AND ("
             f"  CASE "
             f"    WHEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
+            f"         EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
+            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
             f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
+            f"             EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
             f"         >= CURRENT_DATE "
             f"    THEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
+            f"         EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
+            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
             f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
+            f"             EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
             f"    ELSE MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"         EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
+            f"         EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
+            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
             f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"             EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
+            f"             EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
             f"  END"
             f") BETWEEN CURRENT_DATE AND (DATE_TRUNC('MONTH', CURRENT_DATE + MAKE_INTERVAL(months => ${idx})) + INTERVAL '1 MONTH - 1 DAY')::date"
             f")"
@@ -1017,28 +1016,28 @@ async def fetch_carriers(filters: dict) -> dict:
         parts = filters["renewal_date_from"].split("-")
         date_from_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
-            f"AND ih.effective_date IS NOT NULL AND ih.effective_date LIKE '%/%/%' "
-            f"AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = '' "
-            f"OR TO_DATE(ih.cancl_effective_date, 'MM/DD/YYYY') >= CURRENT_DATE) "
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih "
+            f"WHERE ih->>'effective_date' IS NOT NULL AND ih->>'effective_date' LIKE '%/%/%' "
+            f"AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = '' "
+            f"OR TO_DATE(ih->>'cancl_effective_date', 'MM/DD/YYYY') >= CURRENT_DATE) "
             f"AND ("
             f"  CASE "
             f"    WHEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
+            f"         EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
+            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
             f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
+            f"             EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
             f"         >= CURRENT_DATE "
             f"    THEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
+            f"         EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
+            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
             f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
+            f"             EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
             f"    ELSE MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"         EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
+            f"         EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
+            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
             f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"             EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
+            f"             EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
             f"  END"
             f") >= TO_DATE(${idx}, 'MM/DD/YYYY')"
             f")"
@@ -1049,28 +1048,28 @@ async def fetch_carriers(filters: dict) -> dict:
         parts = filters["renewal_date_to"].split("-")
         date_to_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
         conditions.append(
-            f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
-            f"AND ih.effective_date IS NOT NULL AND ih.effective_date LIKE '%/%/%' "
-            f"AND (ih.cancl_effective_date IS NULL OR ih.cancl_effective_date = '' "
-            f"OR TO_DATE(ih.cancl_effective_date, 'MM/DD/YYYY') >= CURRENT_DATE) "
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(insurance_policies, '[]'::jsonb)) ih "
+            f"WHERE ih->>'effective_date' IS NOT NULL AND ih->>'effective_date' LIKE '%/%/%' "
+            f"AND (ih->>'cancl_effective_date' IS NULL OR ih->>'cancl_effective_date' = '' "
+            f"OR TO_DATE(ih->>'cancl_effective_date', 'MM/DD/YYYY') >= CURRENT_DATE) "
             f"AND ("
             f"  CASE "
             f"    WHEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
+            f"         EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
+            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
             f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
+            f"             EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
             f"         >= CURRENT_DATE "
             f"    THEN MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"         EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
+            f"         EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
+            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
             f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int, "
-            f"             EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
+            f"             EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
             f"    ELSE MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"         EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
-            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, "
+            f"         EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
+            f"         LEAST(EXTRACT(DAY FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, "
             f"           EXTRACT(DAY FROM (DATE_TRUNC('MONTH', MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, "
-            f"             EXTRACT(MONTH FROM TO_DATE(ih.effective_date, 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
+            f"             EXTRACT(MONTH FROM TO_DATE(ih->>'effective_date', 'MM/DD/YYYY'))::int, 1)) + INTERVAL '1 MONTH - 1 DAY'))::int)) "
             f"  END"
             f") <= TO_DATE(${idx}, 'MM/DD/YYYY')"
             f")"
@@ -1090,27 +1089,10 @@ async def fetch_carriers(filters: dict) -> dict:
 
     _LIST_COLS = "c.*"
 
-    # Use LEFT JOIN LATERAL to aggregate insurance_history per carrier
-    # in a single pass instead of a correlated subquery per row.
+    # Insurance data is embedded in the insurance_policies JSONB column
     query = f"""
-        SELECT {_LIST_COLS},
-          COALESCE(ih_agg.filings, '[]'::jsonb) AS insurance_history_filings
+        SELECT {_LIST_COLS}
         FROM carriers c
-        LEFT JOIN LATERAL (
-            SELECT jsonb_agg(jsonb_build_object(
-              'ins_type_desc', ih.ins_type_desc,
-              'max_cov_amount', ih.max_cov_amount,
-              'underl_lim_amount', ih.underl_lim_amount,
-              'policy_no', ih.policy_no,
-              'effective_date', ih.effective_date,
-              'ins_form_code', ih.ins_form_code,
-              'name_company', ih.name_company,
-              'trans_date', ih.trans_date,
-              'cancl_effective_date', ih.cancl_effective_date
-            ) ORDER BY ih.effective_date DESC) AS filings
-            FROM insurance_history ih
-            WHERE ih.docket_number = 'MC' || c.mc_number
-        ) ih_agg ON true
         WHERE {where}
         ORDER BY c.created_at DESC
         LIMIT {limit_val} OFFSET {offset_val}
@@ -1786,41 +1768,15 @@ async def delete_new_venture(record_id: str) -> bool:
 
 async def fetch_insurance_history(mc_number: str) -> list[dict]:
     pool = get_pool()
-    docket = f"MC{mc_number}"
     try:
-        rows = await pool.fetch(
-            """
-            SELECT docket_number, dot_number, ins_form_code, ins_type_desc,
-                   name_company, policy_no, trans_date, underl_lim_amount,
-                   max_cov_amount, effective_date, cancl_effective_date
-            FROM insurance_history
-            WHERE docket_number = $1
-            ORDER BY effective_date DESC
-            """,
-            docket,
+        row = await pool.fetchrow(
+            "SELECT insurance_policies FROM carriers WHERE mc_number = $1",
+            mc_number,
         )
-        results = []
-        for row in rows:
-            raw_amount = (row["max_cov_amount"] or "").strip()
-            try:
-                amount_int = int(raw_amount) * 1000
-                coverage = f"${amount_int:,}"
-            except (ValueError, TypeError):
-                coverage = raw_amount or "N/A"
-            cancl = (row["cancl_effective_date"] or "").strip()
-            results.append({
-                "type": (row["ins_type_desc"] or "").strip(),
-                "coverageAmount": coverage,
-                "policyNumber": (row["policy_no"] or "").strip(),
-                "effectiveDate": (row["effective_date"] or "").strip(),
-                "carrier": (row["name_company"] or "").strip(),
-                "formCode": (row["ins_form_code"] or "").strip(),
-                "transDate": (row["trans_date"] or "").strip(),
-                "underlLimAmount": (row["underl_lim_amount"] or "").strip(),
-                "canclEffectiveDate": cancl,
-                "status": "Cancelled" if cancl else "Active",
-            })
-        return results
+        if not row or not row["insurance_policies"]:
+            return []
+        raw = _parse_jsonb(row["insurance_policies"])
+        return _format_insurance_history(raw)
     except Exception as e:
         print(f"[DB] Error fetching insurance history for MC {mc_number}: {e}")
         return []
